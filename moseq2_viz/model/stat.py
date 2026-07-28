@@ -65,7 +65,11 @@ def ztest_vect(d1, d2):
     std1 = d1.std(0)
     std2 = d2.std(0)
     std = np.sqrt(std1 ** 2 + std2 ** 2)
-    return np.minimum(1.0, 2 * stats.norm.cdf(-np.abs(mu1 - mu2) / std))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pvals = np.minimum(1.0, 2 * stats.norm.cdf(-np.abs(mu1 - mu2) / std))
+    # a zero pooled std (a syllable with no bootstrap variance in either group)
+    # carries no evidence of a difference; report p=1 rather than a spurious 0
+    return np.where(std > 0, pvals, 1.0)
 
 
 def bootstrap_group_means(df, group1, group2, statistic="usage", max_syllable=40):
