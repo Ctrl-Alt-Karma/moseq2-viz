@@ -49,7 +49,7 @@ def entropy(labels, truncate_syllable=40, smoothing=1.0, relabel_by="usage"):
 def entropy_rate(
     labels,
     truncate_syllable=40,
-    normalize="row",
+    normalize="rows",
     smoothing=1.0,
     tm_smoothing=1.0,
     relabel_by="usage",
@@ -175,7 +175,10 @@ def transition_entropy(
             # normalize each row (outgoing syllables)
             tm = tm.T
         # if incoming, don't reshape the transition matrix
-        tm = tm / tm.sum(axis=0, keepdims=True)
+        col_sums = tm.sum(axis=0, keepdims=True)
+        # a syllable that is never a transition target has a zero column; guard
+        # the division so it stays 0 instead of becoming NaN (tm_smoothing=0)
+        tm = tm / np.where(col_sums > 0, col_sums, 1)
         tm_safe = np.where(tm > 0, tm, 1)
         ent = -np.sum(tm * np.log2(tm_safe), axis=0)
         entropies.append(ent)
