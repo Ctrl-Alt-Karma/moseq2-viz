@@ -91,10 +91,14 @@ def compute_and_graph_grouped_TMs(config_data, labels, label_group, group):
                                         headless=True)
     # manually add legend for the difference graph
     if len(group) >1:
-        legend_elements = [Line2D([0], [0], color='r', lw=2, label= f'Up-regulated transistion'),
-                           Line2D([0], [0], color='b', lw=2, label= f'Down-regulated transistion'),
-                           Line2D([0], [0], marker='o', color='w', label=f'Up-regulated usage',markerfacecolor='w', markeredgecolor = 'r', markersize=10),
-                           Line2D([0], [0], marker='o', color='w', label=f'Down-regulated usage',markerfacecolor='w', markeredgecolor = 'b', markersize=10)]
+        # Colours must match how edges and nodes are actually drawn: blue for a
+        # positive (up-regulated) difference, red for a negative one. The labels
+        # were swapped, so the legend contradicted the figure it described and
+        # disagreed with the interactive transition graph in moseq2-app.
+        legend_elements = [Line2D([0], [0], color='b', lw=2, label=f'Up-regulated transition'),
+                           Line2D([0], [0], color='r', lw=2, label=f'Down-regulated transition'),
+                           Line2D([0], [0], marker='o', color='w', label=f'Up-regulated usage',markerfacecolor='w', markeredgecolor = 'b', markersize=10),
+                           Line2D([0], [0], marker='o', color='w', label=f'Down-regulated usage',markerfacecolor='w', markeredgecolor = 'r', markersize=10)]
         plt.legend(handles = legend_elements, loc='upper left')
 
     return plt

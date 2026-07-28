@@ -652,7 +652,7 @@ def get_syllable_statistics(data, fill_value=-5, max_syllable=100, count='usage'
         usages[s] = 0
         durations[s] = []
 
-    if isinstance(data, list) or (isinstance(data, np.ndarray) and data.dtype == np.object):
+    if isinstance(data, list) or (isinstance(data, np.ndarray) and data.dtype == object):
 
         for v in data:
             seq_array, locs = get_transitions(v)
@@ -978,7 +978,7 @@ def sort_batch_results(data, averaging=True, filenames=None, **kwargs):
     new_shape = tuple([len(v) for v in param_list])
 
     if filenames is not None:
-        filename_index = np.empty(new_shape, dtype=np.object)
+        filename_index = np.empty(new_shape, dtype=object)
         for i, v in np.ndenumerate(filename_index):
             filename_index[i] = []
     else:
