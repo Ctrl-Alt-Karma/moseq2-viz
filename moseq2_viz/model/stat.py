@@ -1,6 +1,7 @@
 """
 Functions for statistical tests for analyzing model results.
 """
+import warnings
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -10,7 +11,15 @@ from itertools import combinations
 from statsmodels.stats.multitest import multipletests
 
 
-def get_session_mean_df(df, statistic="usage", max_syllable=40):
+# Statistics for which a missing (session, syllable) combination genuinely means
+# zero: the session simply never performed that syllable, so a count/frequency of
+# 0 is the correct observation. Every other statistic (duration, velocity,
+# height, distance...) is a *physical measurement* that is undefined when the
+# syllable was never performed -- filling those with 0 invents data.
+COUNT_STATISTICS = ("usage",)
+
+
+def get_session_mean_df(df, statistic="usage", max_syllable=40, fillna_zero=None):
     """
     Compute a given mean syllable statistic grouped by groups and UUIDs.
 
@@ -18,34 +27,47 @@ def get_session_mean_df(df, statistic="usage", max_syllable=40):
     df (pandas.DataFrame): dataframe that contains average syllable statistics per session (mean_df/stats_df)
     statistic (str): statistic to compute mean for, (any of the columns in input df); for example: 'usage', 'duration', 'velocity_2d_mm', etc.
     max_syllable (int): the index of the maximum number of syllables to include
+    fillna_zero (bool): whether to replace missing (session, syllable) entries with 0.
+        Defaults to True only for count-like statistics (see COUNT_STATISTICS); for
+        physical scalars the entries are left as NaN so callers can drop them.
 
     Returns:
     df_pivot (pandas.DataFrame): Mean syllable statistic per session.
     """
 
-    df_pivot = (
-        df[df.syllable < max_syllable]
-            .pivot_table(index=["group", "uuid"], columns="syllable", values=statistic)
-            .replace(np.nan, 0)
+    df_pivot = df[df.syllable < max_syllable].pivot_table(
+        index=["group", "uuid"], columns="syllable", values=statistic
     )
+
+    if fillna_zero is None:
+        fillna_zero = statistic in COUNT_STATISTICS
+
+    if fillna_zero:
+        df_pivot = df_pivot.replace(np.nan, 0)
 
     return df_pivot
 
 
-def bootstrap_me(usages, n_iters=10000):
+def bootstrap_me(usages, n_iters=10000, seed=0):
     """
     Bootstrap the inputted stat data using random sampling with replacement.
 
     Args:
     usages (np.array): Data to bootstrap
     n_iters (int): Number of samples to return.
+    seed (int): seed for the resampling RNG, so bootstrapped p-values and error
+        bars are reproducible across runs.
 
     Returns:
     boots (np.array): Bootstrapped input array of shape
     """
 
     n_mice = usages.shape[0]
-    return np.nanmean(usages[np.random.choice(n_mice, size=(n_mice, n_iters))], axis=0)
+    rnd = np.random.RandomState(seed=seed)
+    with warnings.catch_warnings():
+        # syllables never observed in any session give an all-NaN slice
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.nanmean(usages[rnd.choice(n_mice, size=(n_mice, n_iters))], axis=0)
 
 
 def ztest_vect(d1, d2):
@@ -258,8 +280,31 @@ def run_kruskal(
 
     rnd = np.random.RandomState(seed=seed)
 
+    # The permutation machinery below ranks across a complete session x syllable
+    # matrix, so this path still fills missing entries with 0. For count-like
+    # statistics that is correct. For physical scalars it is not, so warn rather
+    # than silently biasing the result -- prefer t-test/Mann-Whitney/z-test for
+    # those, which drop missing observations properly.
+    if statistic not in COUNT_STATISTICS:
+        _missing = (
+            get_session_mean_df(df, statistic, max_syllable, fillna_zero=False)
+            .isna()
+            .to_numpy()
+            .sum()
+        )
+        if _missing > 0:
+            warnings.warn(
+                f"{_missing} (session, syllable) entries have no '{statistic}' "
+                "observation because those sessions never expressed the syllable. "
+                "The Kruskal-Wallis permutation test requires a complete matrix, so "
+                "they are being treated as 0, which biases this result. Prefer the "
+                "t-test, Mann-Whitney or z-test for non-count statistics."
+            )
+
     # get mean grouped data
-    grouped_data = get_session_mean_df(df, statistic, max_syllable).reset_index()
+    grouped_data = get_session_mean_df(
+        df, statistic, max_syllable, fillna_zero=True
+    ).reset_index()
 
     # KW Constants
     vc = grouped_data.group.value_counts().loc[grouped_data.group.unique()]
@@ -391,7 +436,12 @@ def compute_pvalues_for_group_pairs(
     df_pval = pd.DataFrame(p_vals_allperm)
 
     correct_p = lambda x: multipletests(x, alpha=thresh, method=mc_method)[1]
-    df_pval_corrected = df_pval.apply(correct_p, axis=1, result_type="broadcast")
+    # Correct across SYLLABLES (axis=0), which is where the multiple-comparison
+    # burden actually lies (~max_syllable tests per group pair). Correcting with
+    # axis=1 corrected across group pairs instead, so a two-group experiment fed
+    # multipletests a length-1 array per syllable and the p-values came back
+    # completely uncorrected.
+    df_pval_corrected = df_pval.apply(correct_p, axis=0, result_type="broadcast")
 
     return df_pval_corrected, ((df_pval_corrected[df_k_real.is_sig] < thresh).sum(0))
 
@@ -493,23 +543,29 @@ def mann_whitney(df, group1, group2, statistic="usage", max_syllable=40, verbose
     df_mw_real (pandas.DataFrame): DataFrame containing Mann-Whitney U corrected results.
     exclude_sylls (list): list of syllables that were excluded via multiple comparisons test.
     """
-    # get mean grouped data
-    grouped_data = get_session_mean_df(df, statistic, max_syllable).reset_index()
+    # select the two groups explicitly. Previously this pivoted *every* group in
+    # the dataframe and then split the rows positionally with array_split, which
+    # mixed other groups' sessions into the comparison (and broke whenever the
+    # passed group order differed from the pivot's sorted order).
+    group_stat = get_session_mean_df(df, statistic, max_syllable)
+    usages1 = group_stat.loc[group1].values
+    usages2 = group_stat.loc[group2].values
 
-    vc = grouped_data.group.value_counts().loc[[group1, group2]]
-    n_per_group = vc.values
+    N_s = usages1.shape[1]
 
-    merged_usages_all = grouped_data[range(max_syllable)].values
-    _, N_s = merged_usages_all.shape
+    results = []
+    for s_i in range(N_s):
+        x, y = usages1[:, s_i], usages2[:, s_i]
+        # drop sessions with no observation for this syllable (NaN); for physical
+        # scalars those sessions never performed it, so they contribute nothing
+        x, y = x[~np.isnan(x)], y[~np.isnan(y)]
+        if len(x) == 0 or len(y) == 0:
+            results.append({"statistic": np.nan, "pvalue": 1.0})
+            continue
+        stat_val, pval = stats.mannwhitneyu(x, y, alternative="two-sided")
+        results.append({"statistic": stat_val, "pvalue": pval})
 
-    df_mw_real = pd.DataFrame(
-        [
-            stats.mannwhitneyu(
-                *np.array_split(merged_usages_all[:, s_i], np.cumsum(n_per_group[:-1]))
-            )
-            for s_i in range(N_s)
-        ]
-    )
+    df_mw_real = pd.DataFrame(results)
     return get_sig_syllables(df_mw_real, verbose=verbose, **kwargs)
 
 
@@ -560,9 +616,15 @@ def ttest(df, group1, group2, statistic="usage", max_syllable=40, verbose=False,
     group_stat = get_session_mean_df(df, statistic, max_syllable)
     groups = (group1, group2)
     usages = {k: group_stat.loc[k].values for k in groups}
-    # run t-test
+    # Welch's t-test (equal_var=False): group sizes and variances routinely differ,
+    # and Student's assumption of equal variance distorts p-values when they do.
+    # nan_policy='omit' drops sessions with no observation for a syllable instead
+    # of treating a missing physical scalar as a real 0.
     df_t = pd.DataFrame(
-        stats.ttest_ind(usages[group1], usages[group2]), index=["t", "pvalue"]
+        stats.ttest_ind(
+            usages[group1], usages[group2], equal_var=False, nan_policy="omit"
+        ),
+        index=["t", "pvalue"],
     ).T
     return get_sig_syllables(df_t, verbose=verbose, **kwargs)
 
