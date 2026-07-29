@@ -417,8 +417,8 @@ def read_pipeline_provenance(path, h5_path='metadata/pipeline'):
     h5_path (str): dataset path holding the JSON provenance record.
 
     Returns:
-    provenance (dict): the provenance record, or None if the file predates
-        provenance stamping (i.e. was produced before this was added).
+    provenance (dict): the provenance record, or None when provenance is
+        UNKNOWN because no usable record could be read.
     """
     import json
 
@@ -439,8 +439,8 @@ def read_pipeline_provenance(path, h5_path='metadata/pipeline'):
 def describe_provenance(provenance):
     """Render a provenance record as a short human-readable string."""
     if not provenance:
-        return ('no provenance recorded (file predates version stamping -- treat '
-                'as incompatible with newly generated data)')
+        return ('UNKNOWN provenance (no usable record; generation history '
+                'cannot be inferred)')
     policies = ', '.join(f'{k}={v}' for k, v in sorted(provenance.get('policies', {}).items()))
     return (f"{provenance.get('package', '?')} {provenance.get('version', '?')} "
             f"@ {str(provenance.get('git_sha', '?'))[:10]} "
@@ -474,7 +474,7 @@ def provenance_from_model(model):
     model (dict): a model result dict, as returned by `parse_model_results`.
 
     Returns:
-    provenance (dict): the record, or None if the model predates stamping.
+    provenance (dict): the record, or None when the model has no usable record.
     """
     if not isinstance(model, dict):
         return None
@@ -506,28 +506,18 @@ def _provenance_policy_conflicts(records):
         is missing from some records is a conflict too; the absent value is
         reported as the string '<absent>'.
     """
-    # Compare within a package, never across. moseq2-extract and moseq2-model
-    # declare entirely different policy keys, so comparing an extraction against
-    # a model would report every key as absent-on-one-side and conflict always.
-    by_package = {}
-    for path, record in records.items():
-        by_package.setdefault((record or {}).get('package', '?'), {})[path] = record
-
     conflicts = {}
-    for package, group in sorted(by_package.items()):
-        if len(group) < 2:
-            continue
-        all_keys = set()
-        for record in group.values():
-            all_keys.update((record or {}).get('policies', {}).keys())
+    all_keys = set()
+    for record in records.values():
+        all_keys.update((record or {}).get('policies', {}).keys())
 
-        for key in sorted(all_keys):
-            by_value = {}
-            for path, record in group.items():
-                value = (record or {}).get('policies', {}).get(key, '<absent>')
-                by_value.setdefault(str(value), []).append(path)
-            if len(by_value) > 1:
-                conflicts[f'{package}:{key}' if len(by_package) > 1 else key] = by_value
+    for key in sorted(all_keys):
+        by_value = {}
+        for path, record in records.items():
+            value = (record or {}).get('policies', {}).get(key, '<absent>')
+            by_value.setdefault(str(value), []).append(path)
+        if len(by_value) > 1:
+            conflicts[key] = by_value
     return conflicts
 
 
@@ -564,12 +554,12 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
       values for the same output policy (e.g. one was extracted with the
       small-angle focal length and one with the pinhole projection). Their
       millimetre scalars are on different scales; pooling them is never correct.
-    * **Stamped mixed with unstamped -> error.** An unstamped file predates
-      version stamping, so its policies are unknown and cannot be assumed to
-      match the stamped ones. This is the common half-reprocessed-dataset case.
-    * **All unstamped -> warning.** Every file predates stamping. They are
-      probably mutually consistent (all produced by the old code), so this is
-      allowed, but the user is told the pipeline cannot verify it.
+    * **Stamped mixed with unstamped -> error.** An unstamped file has UNKNOWN
+      provenance, so its policies cannot be assumed to match stamped records.
+    * **All unstamped -> warning.** Every file has UNKNOWN provenance. Pooling
+      is allowed, but the pipeline cannot establish compatibility.
+    * **Different packages -> error.** Package-specific policy maps do not prove
+      cross-package lineage or compatibility.
     * **All stamped and agreeing -> silent.**
 
     Comparison is on the semantic policy tags only. Two files built from
@@ -630,9 +620,9 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
         return _report(
             f'Refusing to pool files with mixed provenance into {context}.\n'
             f'{len(stamped)} of {len(paths)} files carry a pipeline provenance '
-            f'record and {len(unstamped)} do not. Unstamped files were produced '
-            'before version stamping existed, so their output policies are '
-            'unknown and cannot be assumed to match.\n'
+            f'record and {len(unstamped)} do not. Unstamped files have UNKNOWN '
+            'provenance; their generation history and output policies cannot '
+            'be inferred or assumed to match.\n'
             '  unstamped:\n'
             + '\n'.join(f'    {p}' for p in unstamped)
             + '\n  stamped:\n'
@@ -642,10 +632,20 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
     if not stamped:
         warnings.warn(
             f'None of the {len(paths)} files being pooled into {context} carry '
-            'a pipeline provenance record; they all predate version stamping. '
-            'They are most likely mutually consistent, but the pipeline cannot '
-            'verify that. Reprocess them to get a verifiable record.')
+            'a usable pipeline provenance record; provenance is UNKNOWN for '
+            'every file, so compatibility cannot be established. Reprocess '
+            'them to get verifiable records.')
         return False
+
+    packages = sorted({(record or {}).get('package', '?')
+                       for record in stamped.values()})
+    if len(packages) > 1:
+        return _report(
+            f'Refusing to claim cross-package provenance compatibility for '
+            f'{context}. The records come from {packages}, whose policy maps '
+            'are package-specific and do not share a lineage identifier. '
+            'Comparing one record from each package would be a no-op, not a '
+            'compatibility check.')
 
     conflicts = _provenance_policy_conflicts(stamped)
     if conflicts:
@@ -705,9 +705,9 @@ def assert_consistent_provenance(paths, h5_path='metadata/pipeline'):
     if unstamped:
         warnings.warn(
             f'{len(unstamped)} of {len(paths)} files have no pipeline provenance '
-            'and were produced before version stamping. They may have been '
-            'generated by code with different numerical behaviour; regenerate '
-            'them before combining with newer files.')
+            'record. Their provenance is UNKNOWN; generation history and '
+            'numerical behaviour cannot be inferred. Regenerate them before '
+            'combining with stamped files.')
     if len(policy_sets) > 1:
         warnings.warn(
             'Files were produced by pipelines with DIFFERENT output policies. '

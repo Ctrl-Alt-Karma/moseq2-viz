@@ -1,8 +1,11 @@
 import joblib
 import unittest
+import os
+import tempfile
+import warnings
 import numpy as np
 import pandas as pd
-from unittest import TestCase
+from unittest import TestCase, mock
 from cytoolz import merge_with
 from moseq2_viz.util import parse_index, read_yaml
 from moseq2_viz.model.util import parse_model_results, h5_to_dict
@@ -337,6 +340,52 @@ class TestDeprecatedScalars(TestCase):
         assert 'velocity_3d_mm' in out.columns
         assert len(caught) >= 1
 
+    def test_legacy_numeric_mapping_stays_a_mapping(self):
+        from moseq2_viz.scalars.util import drop_deprecated_scalars
+        values = {
+            'velocity_3d_px': np.asarray([1.0, 2.0]),
+            'velocity_3d_mm': np.asarray([3.0, 4.0]),
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            out = drop_deprecated_scalars(values)
+        assert isinstance(out, dict)
+        assert list(out) == ['velocity_3d_mm']
+        np.testing.assert_array_equal(out['velocity_3d_mm'], [3.0, 4.0])
+
+    def test_get_scalar_map_drops_legacy_key_without_losing_mapping(self):
+        index = {
+            'pca_path': 'scores.h5',
+            'files': {'session': {'path': ['session.h5']}},
+        }
+
+        def fake_h5_to_dict(path, key):
+            if key == 'scores_idx':
+                return {'session': np.asarray([0.0, 1.0])}
+            if key == 'scalars':
+                return {
+                    'velocity_3d_px': np.asarray([9.0, 9.0]),
+                    'velocity_3d_mm': np.asarray([3.0, 4.0]),
+                }
+            raise AssertionError((path, key))
+
+        with mock.patch(
+            'moseq2_viz.scalars.util.h5_to_dict',
+            side_effect=fake_h5_to_dict,
+        ), mock.patch(
+            'moseq2_viz.scalars.util.enforce_consistent_provenance',
+            return_value=True,
+        ), warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            scalar_map = get_scalar_map(index)
+
+        assert isinstance(scalar_map, dict)
+        assert isinstance(scalar_map['session'], dict)
+        assert 'velocity_3d_px' not in scalar_map['session']
+        np.testing.assert_array_equal(
+            scalar_map['session']['velocity_3d_mm'], [3.0, 4.0]
+        )
+
     def test_legacy_conversion_does_not_recreate_it(self):
         # convert_legacy_scalars(force=True) must not resurrect the mixed-unit key
         from moseq2_viz.scalars.util import convert_legacy_scalars
@@ -385,6 +434,52 @@ class TestDeprecatedScalars(TestCase):
         out = compute_mean_syll_scalar(df, scalar='velocity_2d_mm')
         assert 'velocity_2d_mm' in out.columns
         assert np.isfinite(out['velocity_2d_mm'].dropna()).all()
+
+    def test_public_scalar_selectors_reject_legacy_dataframe_column(self):
+        from moseq2_viz.scalars.util import (
+            compute_all_pdf_data,
+            compute_mean_syll_scalar,
+            get_scalar_triggered_average,
+            process_scalars,
+        )
+
+        legacy_df = pd.DataFrame({
+            'velocity_3d_px': [1.0],
+            'labels (usage sort)': [0],
+            'group': ['g'],
+            'uuid': ['u'],
+        })
+        with self.assertRaises(ValueError):
+            compute_mean_syll_scalar(legacy_df, scalar='velocity_3d_px')
+        with self.assertRaises(ValueError):
+            compute_all_pdf_data(
+                legacy_df,
+                centroid_vars=['velocity_3d_px', 'velocity_2d_px'],
+            )
+        with self.assertRaises(ValueError):
+            get_scalar_triggered_average(
+                {}, {}, include_keys=['velocity_3d_px']
+            )
+        with self.assertRaises(ValueError):
+            process_scalars({}, ['velocity_3d_px'])
+
+    def test_model_parse_errors_are_not_swallowed(self):
+        handle, model_path = tempfile.mkstemp(suffix='.p')
+        os.close(handle)
+        try:
+            with mock.patch(
+                'moseq2_viz.scalars.util.prepare_model_dataframe',
+                side_effect=ValueError('corrupt model provenance'),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, 'corrupt model provenance'
+                ):
+                    scalars_to_dataframe(
+                        {'pca_path': 'scores.h5', 'files': {}},
+                        model_path=model_path,
+                    )
+        finally:
+            os.remove(model_path)
 
 
 class TestPinholeProjection(TestCase):

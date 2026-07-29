@@ -124,7 +124,7 @@ class TestProvenanceGate(TestCase):
             warnings.simplefilter('always')
             self.assertFalse(enforce_consistent_provenance(paths))
         self.assertEqual(len(caught), 1)
-        self.assertIn('predate version stamping', str(caught[0].message))
+        self.assertIn('provenance is UNKNOWN', str(caught[0].message))
 
     def test_allow_mixed_downgrades_conflict_to_a_loud_warning(self):
         good = _write_h5(self._path('pinhole.h5'), _record(focal_length='pinhole'))
@@ -266,26 +266,30 @@ class TestRequiredScalarPolicies(TestCase):
         self.assertEqual([str(w.message) for w in caught], [])
 
 
-class TestCrossPackageComparison(TestCase):
+class TestCrossPackageScope(TestCase):
     """
-    PCA and model records declare disjoint policy keys. Comparing them against
-    each other key-by-key would report every key as absent-on-one-side, so
-    comparison has to be grouped by package.
+    Package-specific policy maps do not establish PCA/model shared lineage.
+    A single record from each package must not pass as a compatibility check.
     """
 
-    def test_disjoint_packages_do_not_conflict(self):
+    def test_disjoint_packages_are_not_claimed_compatible(self):
         pca = {'package': 'moseq2-pca', 'version': '1.0',
                'policies': {'changepoint_sigma': '1.3', 'fps_source': 'median'}}
         model = {'package': 'moseq2-model', 'version': '1.0',
                  'policies': {'sampler_seeding': 'explicit-seed'}}
         records = {'scores.h5': pca, 'model.p': model}
-        self.assertTrue(enforce_consistent_provenance(list(records), records=records))
+        with self.assertRaises(ProvenanceError) as ctx:
+            enforce_consistent_provenance(list(records), records=records)
+        message = str(ctx.exception)
+        self.assertIn('cross-package', message)
+        self.assertIn('no-op', message)
+        self.assertIn('moseq2-pca', message)
+        self.assertIn('moseq2-model', message)
 
     def test_two_files_of_the_same_package_still_conflict(self):
         records = {
             'a.h5': {'package': 'moseq2-pca', 'policies': {'changepoint_sigma': '1.3'}},
             'b.h5': {'package': 'moseq2-pca', 'policies': {'changepoint_sigma': '2.0'}},
-            'model.p': {'package': 'moseq2-model', 'policies': {'sampler_seeding': 'explicit-seed'}},
         }
         with self.assertRaises(ProvenanceError) as ctx:
             enforce_consistent_provenance(list(records), records=records)
@@ -293,15 +297,6 @@ class TestCrossPackageComparison(TestCase):
         self.assertIn('changepoint_sigma', message)
         self.assertIn('a.h5', message)
         self.assertIn('b.h5', message)
-
-    def test_unstamped_model_against_stamped_pca_fails(self):
-        records = {
-            'scores.h5': {'package': 'moseq2-pca', 'policies': {'fps_source': 'median'}},
-            'model.p': None,
-        }
-        with self.assertRaises(ProvenanceError) as ctx:
-            enforce_consistent_provenance(list(records), records=records)
-        self.assertIn('model.p', str(ctx.exception))
 
     def test_provenance_from_model_reads_the_pickled_record(self):
         record = {'package': 'moseq2-model', 'policies': {'sampler_seeding': 'explicit-seed'}}
@@ -331,8 +326,10 @@ class TestProvenanceReading(TestCase):
         _write_h5(path, None)
         self.assertIsNone(read_pipeline_provenance(path))
 
-    def test_describe_flags_unstamped_as_incompatible(self):
-        self.assertIn('treat as incompatible', describe_provenance(None))
+    def test_describe_unstamped_as_unknown(self):
+        description = describe_provenance(None)
+        self.assertIn('UNKNOWN provenance', description)
+        self.assertIn('cannot be inferred', description)
 
     def test_describe_lists_policies(self):
         text = describe_provenance(_record(focal_length='pinhole'))

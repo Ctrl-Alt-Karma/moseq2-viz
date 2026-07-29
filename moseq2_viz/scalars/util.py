@@ -10,12 +10,13 @@ from tqdm.auto import tqdm
 from itertools import starmap
 from os.path import exists
 from collections import defaultdict
+from collections.abc import Mapping
 from cytoolz import valmap, get, merge, keyfilter
 from moseq2_viz.model.util import get_transitions, prepare_model_dataframe
 from moseq2_viz.util import (h5_to_dict, strided_app, h5_filepath_from_sorted,
                              get_timestamps_from_h5, parse_index,
-                             enforce_consistent_provenance, read_pipeline_provenance,
-                             provenance_from_model, SCALAR_POOLING_POLICIES)
+                             enforce_consistent_provenance,
+                             SCALAR_POOLING_POLICIES)
 
 
 def _star_itemmap(func, d):
@@ -100,14 +101,16 @@ def check_scalar_is_usable(scalar):
     Raise if a scalar is deprecated and must not be used for analysis.
 
     Args:
-    scalar (str): scalar column name being requested.
+    scalar (str or iterable of str): scalar column name(s) being requested.
 
     Raises:
     ValueError: if the scalar is in DEPRECATED_SCALARS.
     """
 
-    if scalar in DEPRECATED_SCALARS:
-        raise ValueError(DEPRECATED_SCALARS[scalar])
+    requested = [scalar] if isinstance(scalar, str) else list(scalar)
+    for name in requested:
+        if name in DEPRECATED_SCALARS:
+            raise ValueError(DEPRECATED_SCALARS[name])
 
 
 def drop_deprecated_scalars(scalars, warn=True):
@@ -120,11 +123,12 @@ def drop_deprecated_scalars(scalars, warn=True):
     middle path.
 
     Args:
-    scalars (pd.DataFrame or iterable of str): scalar table or column names.
+    scalars (pd.DataFrame, mapping, or iterable of str): scalar values or names.
     warn (bool): emit a warning naming what was dropped.
 
     Returns:
-    The same type as the input, without deprecated scalars.
+    A DataFrame for DataFrame input, a dict for mapping input, or a list of
+    names for other iterables, without deprecated scalars.
     """
 
     if isinstance(scalars, pd.DataFrame):
@@ -134,6 +138,18 @@ def drop_deprecated_scalars(scalars, warn=True):
                 'Dropping deprecated scalar(s) %s from this dataset. %s'
                 % (present, ' '.join(DEPRECATED_SCALARS[c] for c in present)))
         return scalars.drop(columns=present) if present else scalars
+
+    if isinstance(scalars, Mapping):
+        present = [name for name in scalars if name in DEPRECATED_SCALARS]
+        if present and warn:
+            warnings.warn(
+                'Ignoring deprecated scalar(s) %s. %s'
+                % (present, ' '.join(DEPRECATED_SCALARS[c] for c in present)))
+        return {
+            name: values
+            for name, values in scalars.items()
+            if name not in DEPRECATED_SCALARS
+        }
 
     names = list(scalars)
     present = [n for n in names if n in DEPRECATED_SCALARS]
@@ -364,6 +380,7 @@ def get_scalar_triggered_average(scalar_map, model_labels, max_syllable=40, nlag
     syll_average (dict): dictionary of scalars for each syllable sequence.
     """
 
+    check_scalar_is_usable(include_keys)
     win = int(nlags * 2 + 1)
 
     # cumulative average of PCs for nlags
@@ -455,6 +472,7 @@ def process_scalars(scalar_map: dict, include_keys: list, zscore: bool = False) 
     scalar_map (dict): dict that contains the updated NaN-filled values.
     """
 
+    check_scalar_is_usable(include_keys)
     out = defaultdict(list)
     for k, v in scalar_map.items():
         for scalar in include_keys:
@@ -533,20 +551,12 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
     has_model = False # indicator for whether users inputted a model_path to load syllable labels from
     model_uuids = None
     model_type = ''
-    model_provenance = None
     if model_path is not None and exists(model_path):
         labels_df = prepare_model_dataframe(model_path, index['pca_path']).set_index('uuid')
         model_type = labels_df['model_type'].unique()[0]
         has_model = True
         # loading the session uuids that the model was trained on
         model_uuids = labels_df.reset_index().uuid.unique()
-        try:
-            from moseq2_viz.model.util import parse_model_results
-            model_provenance = provenance_from_model(parse_model_results(model_path))
-        except Exception:
-            # the model's own provenance is a nice-to-have; failing to read it
-            # must not stop the scalars from being built
-            model_provenance = None
 
     # check if files is dictionary from sorted_index or list from unsorted index, then sort
     if isinstance(index['files'], list):
@@ -561,22 +571,11 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
                                   context='the scalar dataframe',
                                   required_policies=SCALAR_POOLING_POLICIES)
 
-    # When a model is being joined onto the scalars, the PC scores and the model
-    # are part of the same analysis and carry their own policy maps. They are
-    # different packages with different policy keys, so they are compared
-    # against each other, not against the extractions.
-    if has_model:
-        upstream = {}
-        pca_path = index.get('pca_path')
-        if pca_path is not None and exists(pca_path):
-            upstream[pca_path] = read_pipeline_provenance(pca_path)
-        if model_provenance is not None:
-            upstream[str(model_path)] = model_provenance
-        if len(upstream) > 1:
-            enforce_consistent_provenance(
-                list(upstream), records=upstream,
-                allow_mixed=allow_mixed_provenance,
-                context='the modelled scalar dataframe')
+    # Scope deliberately stops at extraction-to-extraction compatibility.
+    # PCA and model records use package-specific policy keys and do not expose a
+    # shared lineage identifier, so comparing one record from each package
+    # cannot establish compatibility. Model parsing still happens through
+    # prepare_model_dataframe above, and parsing failures propagate to callers.
 
     dfs = []
     # Iterate through index file session info and paths
@@ -682,6 +681,7 @@ def compute_all_pdf_data(scalar_df, normalize=False, centroid_vars=['centroid_x_
     subjectNames (list): list of strings of subjectNames corresponding to pdfs index.
     """
 
+    check_scalar_is_usable(centroid_vars)
     sessions, groups, subjectNames, pdfs = [], [], [], []
 
     for uuid, _df in scalar_df.groupby('uuid', sort=False):
@@ -714,6 +714,7 @@ def compute_mean_syll_scalar(scalar_df, scalar='velocity_3d_mm', max_sylls=40, s
     Returns:
     mean_df (pandas.DataFrame): updated input DataFrame with a speed value for each syllable merge in as a new column.
     """
+    check_scalar_is_usable(scalar)
     if syllable_key not in scalar_df:
         raise ValueError('scalar_df must be loaded with labels. Supply a model path to scalars_to_dataframe.')
 
