@@ -1,8 +1,10 @@
 import joblib
 import unittest
 import os
+import json
 import tempfile
 import warnings
+import h5py
 import numpy as np
 import pandas as pd
 from unittest import TestCase, mock
@@ -52,9 +54,15 @@ class TestScalarUtils(TestCase):
 
         test_coords = convert_pxs_to_mm(coords, resolution, field_of_view, true_depth)
 
-        # pinhole projection: f = (resolution / 2) / tan(fov / 2)
-        expected = np.asarray([[-476, -388], [0, 0], [476, 388]])
-        np.testing.assert_array_equal(test_coords, expected)
+        # pinhole projection: f = (resolution / 2) / tan(fov / 2).
+        # Integer pixel inputs must still retain fractional millimetres.
+        expected = np.asarray([
+            [-476.58136532, -388.61446619],
+            [0.0, 0.0],
+            [476.58136532, 388.61446619],
+        ])
+        assert np.issubdtype(test_coords.dtype, np.floating)
+        np.testing.assert_allclose(test_coords, expected, rtol=0, atol=1e-8)
         assert not np.isnan(test_coords).any()
 
     def test_convert_pxs_to_mm_matches_camera_intrinsics(self):
@@ -227,9 +235,9 @@ class TestScalarUtils(TestCase):
                    'length_px', 'velocity_2d_mm', 'velocity_2d_px', 'velocity_3d_mm',
                    'velocity_theta', 'width_mm', 'width_px',
                    'dist_to_center_px', 'group', 'uuid', 'h5_path', 'timestamps',
-                   # the trailing metadata columns come out in the order they
-                   # appear in the session yaml, which is alphabetical here
-                   'frame index', 'SessionName', 'StartTime', 'SubjectName']
+                   # public contract: metadata follows include_keys order, not
+                   # incidental YAML/dict insertion order
+                   'frame index', 'SessionName', 'SubjectName', 'StartTime']
 
         total_frames = 1800
 
@@ -328,6 +336,91 @@ class TestDeprecatedScalars(TestCase):
         from moseq2_viz.scalars.util import check_scalar_is_usable
         for ok in ('velocity_2d_px', 'velocity_2d_mm', 'velocity_3d_mm', 'area_mm'):
             check_scalar_is_usable(ok)  # must not raise
+
+    def _manual_legacy_dataframe(self):
+        return pd.DataFrame({
+            'group': ['g', 'g', 'h', 'h'],
+            'uuid': ['a', 'a', 'b', 'b'],
+            'SubjectName': ['s1', 's1', 's2', 's2'],
+            'SessionName': ['x', 'x', 'y', 'y'],
+            'velocity_3d_px': np.asarray([1, 2, 3, 4], dtype='float32'),
+            'labels (original)': [0, 0, 1, 1],
+            'labels (usage sort)': [0, 0, 1, 1],
+            'onset': [True, False, True, False],
+        })
+
+    def test_scalar_plot_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.viz import scalar_plot
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            scalar_plot(
+                self._manual_legacy_dataframe(),
+                show_scalars=['velocity_3d_px'],
+                headless=True,
+            )
+
+    def test_position_plot_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.viz import position_plot
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            position_plot(
+                self._manual_legacy_dataframe(),
+                centroid_vars=['velocity_3d_px', 'velocity_3d_px'],
+                sort_vars=['uuid'],
+            )
+
+    def test_behavioral_statistics_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.model.util import compute_behavioral_statistics
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            compute_behavioral_statistics(self._manual_legacy_dataframe())
+
+    def test_scalar_embedding_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.model.embed import run_2d_scalar_embedding
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            run_2d_scalar_embedding(self._manual_legacy_dataframe())
+
+    def test_metadata_columns_follow_include_keys_not_source_dict_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'session.h5')
+            policies = {
+                'scalar_px_to_mm': 'pinhole',
+                'area_units': 'mm2-xy-product',
+                'background_dropout': 'masked',
+                'roi_plane_fit': 'lstsq-inlier-refit',
+                'hampel_filter': 'mad-threshold-both-axes',
+                'depth_range_detection': 'histogram-mode',
+                'velocity_3d_px': 'invalid-mixed-units-omitted',
+            }
+            with h5py.File(path, 'w') as f:
+                f.create_dataset('scalars/angle', data=[0.0, 0.1])
+                f.create_dataset('timestamps', data=[0.0, 1.0])
+                f.create_dataset(
+                    'metadata/extraction/pipeline',
+                    data=json.dumps({
+                        'package': 'moseq2-extract',
+                        'policies': policies,
+                    }),
+                )
+            index = {
+                'files': {
+                    'uuid': {
+                        'path': (path, os.path.join(tmp, 'session.yaml')),
+                        'group': 'g',
+                        # Deliberately not the API order.
+                        'metadata': {
+                            'SessionName': 'session',
+                            'StartTime': 'noon',
+                            'SubjectName': 'mouse',
+                        },
+                    },
+                },
+                'pca_path': os.path.join(tmp, 'unused.h5'),
+            }
+            frame = scalars_to_dataframe(index, disable_output=True)
+            metadata = [
+                column for column in frame.columns
+                if column in ('SessionName', 'SubjectName', 'StartTime')
+            ]
+            self.assertEqual(
+                metadata, ['SessionName', 'SubjectName', 'StartTime'])
 
     def test_legacy_numeric_column_is_dropped_with_warning(self):
         import warnings as _w
@@ -540,22 +633,3 @@ class TestPinholeProjection(TestCase):
         # assertion fails if the conversion regresses
         small_angle_step = 673.1 / (512 / (2 * np.deg2rad(70.6 / 2)))
         assert abs(step - small_angle_step) > 0.15
-
-    def test_legacy_force_conversion_matches_extract(self):
-        """viz's forced legacy path and extract must agree to floating point."""
-        from moseq2_viz.scalars.util import convert_legacy_scalars
-        from moseq2_extract.util import convert_pxs_to_mm as extract_conv
-
-        xs = np.asarray([0.0, 100.0, 256.0, 511.0])
-        ys = np.asarray([0.0, 90.0, 212.0, 423.0])
-        legacy = {
-            'centroid_x': xs, 'centroid_y': ys,
-            'width': np.full(4, 20.0), 'length': np.full(4, 30.0),
-            'area': np.full(4, 600.0), 'height_ave': np.full(4, 25.0),
-            'angle': np.zeros(4),
-        }
-        out = convert_legacy_scalars(legacy, force=True, true_depth=673.1)
-        expected = extract_conv(np.stack([xs, ys], axis=1), true_depth=673.1)
-
-        np.testing.assert_allclose(out['centroid_x_mm'], expected[:, 0], rtol=1e-12)
-        np.testing.assert_allclose(out['centroid_y_mm'], expected[:, 1], rtol=1e-12)

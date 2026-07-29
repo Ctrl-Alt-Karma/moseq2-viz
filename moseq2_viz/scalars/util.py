@@ -16,7 +16,8 @@ from moseq2_viz.model.util import get_transitions, prepare_model_dataframe
 from moseq2_viz.util import (h5_to_dict, strided_app, h5_filepath_from_sorted,
                              get_timestamps_from_h5, parse_index,
                              enforce_consistent_provenance,
-                             SCALAR_POOLING_POLICIES)
+                             SCALAR_POOLING_POLICIES, DEPRECATED_SCALARS,
+                             check_scalar_is_usable)
 
 
 def _star_itemmap(func, d):
@@ -72,45 +73,13 @@ def convert_pxs_to_mm(coords, resolution=(512, 424), field_of_view=(70.6, 60), t
     fw = resolution[0] / (2 * np.tan(np.deg2rad(field_of_view[0] / 2)))
     fh = resolution[1] / (2 * np.tan(np.deg2rad(field_of_view[1] / 2)))
 
-    new_coords = np.zeros_like(coords)
+    # Millimetres are fractional even when pixel coordinates are integers.
+    # ``zeros_like`` inherited an integer dtype and silently truncated them.
+    new_coords = np.zeros(np.asarray(coords).shape, dtype="float64")
     new_coords[:, 0] = true_depth * xhat / fw
     new_coords[:, 1] = true_depth * yhat / fh
 
     return new_coords
-
-
-# Scalars that must not be used for analysis, mapped to why and what to use.
-# velocity_3d_px combined pixels-per-frame x/y with millimetres-per-frame z
-# under one square root -- sqrt(px^2 + px^2 + mm^2) -- so it has no coherent
-# physical unit. Legacy files still contain numeric values for it; they are
-# plausible-looking but meaningless, so requesting it is an error rather than a
-# warning.
-DEPRECATED_SCALARS = {
-    'velocity_3d_px': (
-        "velocity_3d_px mixed units: its x/y terms are pixels-per-frame while "
-        "its z term (from height_ave_mm) is millimetres-per-frame, so the value "
-        "has no coherent physical unit. Use 'velocity_3d_mm' for 3D speed (all "
-        "axes in mm), 'velocity_2d_mm' for horizontal speed in mm, or "
-        "'velocity_2d_px' for horizontal speed in pixels."
-    ),
-}
-
-
-def check_scalar_is_usable(scalar):
-    """
-    Raise if a scalar is deprecated and must not be used for analysis.
-
-    Args:
-    scalar (str or iterable of str): scalar column name(s) being requested.
-
-    Raises:
-    ValueError: if the scalar is in DEPRECATED_SCALARS.
-    """
-
-    requested = [scalar] if isinstance(scalar, str) else list(scalar)
-    for name in requested:
-        if name in DEPRECATED_SCALARS:
-            raise ValueError(DEPRECATED_SCALARS[name])
 
 
 def drop_deprecated_scalars(scalars, warn=True):
@@ -604,13 +573,18 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
         if is_legacy(dset) and force_conversion:
             dset = convert_legacy_scalars(dset, force=force_conversion)
 
+        metadata = {
+            name: v['metadata'][name]
+            for name in include_keys
+            if name in v['metadata']
+        }
         dset = merge(dset, {
             'group': v['group'],
             'uuid': k,
             'h5_path': pth,
             'timestamps': timestamps,
             'frame index': np.arange(len(timestamps))},
-            keyfilter(lambda x: x in include_keys, v['metadata'])
+            metadata
         )
 
         try:

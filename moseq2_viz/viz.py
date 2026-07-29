@@ -16,6 +16,7 @@ from scipy.stats import mode
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
 from moseq2_viz.model.util import sort_syllables_by_stat, sort_syllables_by_stat_difference
+from moseq2_viz.util import validate_scalar_dataframe
 
 
 def _validate_and_order_syll_stats_params(complete_df, stat='usage', ordering='stat', max_sylls=40, groups=None, ctrl_group=None, exp_group=None,
@@ -366,6 +367,7 @@ def position_plot(scalar_df, centroid_vars=['centroid_x_mm', 'centroid_y_mm'],
     g (sns.FacetGrid): FacetGrid object the data was plotted with
     """
 
+    validate_scalar_dataframe(scalar_df, centroid_vars)
     assert len(centroid_vars) == 2, 'must supply 2 centroid vars (x, y) to plot position'
 
     if isinstance(sort_vars, str) :
@@ -410,6 +412,8 @@ def scalar_plot(scalar_df, sort_vars=['group', 'uuid'], group_var='group',
     fig (pyplot figure): plotted scalar scatter plot
     ax (pyplot axis): plotted scalar axis
     """
+    validate_scalar_dataframe(scalar_df, show_scalars)
+
     if headless:
         plt.switch_backend('agg')
 

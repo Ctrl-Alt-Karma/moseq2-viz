@@ -4,6 +4,8 @@ General utility functions fors loading and organizing data.
 
 import re
 import os
+import json
+import hashlib
 import h5py
 import numpy as np
 from glob import glob
@@ -408,6 +410,223 @@ def assert_model_and_index_uuids_match(model, index):
     assert index_uuids == model_uuids, "Index file UUIDS must match the model UUIDs."
 
 
+class ProvenanceError(ValueError):
+    """
+    Raised when provenance is corrupt or files about to be pooled are
+    incompatible.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working, but is catchable on its own for callers that want to offer an
+    explicit override for compatibility conflicts. Corrupt records are never
+    overrideable.
+    """
+
+
+# Extract writes the first path. The second is a historical fallback. Every
+# reader uses this order and rejects conflicting dual records.
+PIPELINE_PROVENANCE_PATHS = (
+    'metadata/extraction/pipeline',
+    'metadata/pipeline',
+)
+
+FLIP_RECORD_PATHS = (
+    'metadata/processing/flip_classifier',
+    'metadata/processing/flip_classifier_journal',
+)
+FLIP_RECORD_UPDATE_ATTR = 'flip_classifier_record_update_in_progress'
+LEGACY_FLIP_ATTR = 'flip_classifier_applied'
+
+# Scalars that must not enter analysis. Kept in this low-level module so public
+# plotting, model, and scalar helpers can share one guard without circular
+# imports.
+DEPRECATED_SCALARS = {
+    'velocity_3d_px': (
+        "velocity_3d_px mixed units: its x/y terms are pixels-per-frame while "
+        "its z term (from height_ave_mm) is millimetres-per-frame, so the value "
+        "has no coherent physical unit. Use 'velocity_3d_mm' for 3D speed (all "
+        "axes in mm), 'velocity_2d_mm' for horizontal speed in mm, or "
+        "'velocity_2d_px' for horizontal speed in pixels."
+    ),
+}
+
+
+def check_scalar_is_usable(scalar):
+    """Raise when a requested scalar is deprecated and invalid for analysis."""
+    requested = [scalar] if isinstance(scalar, str) else list(scalar)
+    for name in requested:
+        if name in DEPRECATED_SCALARS:
+            raise ValueError(DEPRECATED_SCALARS[name])
+
+
+def validate_scalar_dataframe(scalar_df, scalar_names=None):
+    """Validate explicit scalar names or every column in a dataframe."""
+    names = scalar_df.columns if scalar_names is None else scalar_names
+    check_scalar_is_usable(names)
+
+
+def _json_mapping_from_h5(f, dataset, label):
+    """Read a JSON mapping or raise a non-overrideable provenance error."""
+    try:
+        raw = f[dataset][()]
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        record = json.loads(raw)
+    except (OSError, UnicodeError, TypeError, ValueError, KeyError) as error:
+        raise ProvenanceError(
+            "CORRUPT {} at {!r}: {}: {}".format(
+                label, dataset, type(error).__name__, error
+            )
+        )
+    if not isinstance(record, dict):
+        raise ProvenanceError(
+            "CORRUPT {} at {!r}: JSON must be an object/mapping, got {}".format(
+                label, dataset, type(record).__name__
+            )
+        )
+    return record
+
+
+def _provenance_candidates(h5_path):
+    """Return the one documented provenance-path order plus a custom path."""
+    candidates = list(PIPELINE_PROVENANCE_PATHS)
+    if h5_path and h5_path not in candidates:
+        candidates.insert(0, h5_path)
+    return candidates
+
+
+def _read_extraction_provenance(f, h5_path):
+    """Return ABSENT as None, VALID as a mapping, and raise on CORRUPT."""
+    records = []
+    for candidate in _provenance_candidates(h5_path):
+        if candidate in f:
+            records.append((
+                candidate,
+                _json_mapping_from_h5(f, candidate, 'pipeline provenance'),
+            ))
+    if not records:
+        return None
+
+    canonical = {
+        json.dumps(record, sort_keys=True, separators=(',', ':'))
+        for _, record in records
+    }
+    if len(canonical) > 1:
+        raise ProvenanceError(
+            'CORRUPT pipeline provenance: conflicting records exist at {}. '
+            'Readers must not silently choose one.'.format(
+                ', '.join(repr(path) for path, _ in records)
+            )
+        )
+    return records[0][1]
+
+
+def _read_flip_correction_policy(f):
+    """
+    Derive the app flip-correction policy without modifying extraction records.
+
+    Incomplete, failed, corrupt, legacy-only, and interrupted states are
+    ambiguous for orientation data and therefore hard-fail pooling.
+    """
+    if f.attrs.get(FLIP_RECORD_UPDATE_ATTR, False):
+        raise ProvenanceError(
+            'Flip-correction provenance is ambiguous: the processing-record '
+            'update sentinel is still set.'
+        )
+
+    records = []
+    for candidate in FLIP_RECORD_PATHS:
+        if candidate not in f:
+            continue
+        record = _json_mapping_from_h5(
+            f, candidate, 'flip-correction processing record'
+        )
+        try:
+            sequence = int(record.get('_journal_sequence', 0))
+        except (TypeError, ValueError) as error:
+            raise ProvenanceError(
+                "CORRUPT flip-correction processing record at {!r}: {}".format(
+                    candidate, error
+                )
+            )
+        records.append((sequence, candidate, record))
+
+    if not records:
+        if f.attrs.get(LEGACY_FLIP_ATTR, False):
+            raise ProvenanceError(
+                'Flip-correction provenance is ambiguous: only the legacy '
+                'Boolean latch is present, so the classifier and settings are '
+                'unknown.'
+            )
+        return 'not_applied'
+
+    max_sequence = max(sequence for sequence, _, _ in records)
+    latest = [
+        (path, record)
+        for sequence, path, record in records
+        if sequence == max_sequence
+    ]
+    if len(latest) > 1:
+        canonical = {
+            json.dumps(record, sort_keys=True, separators=(',', ':'))
+            for _, record in latest
+        }
+        if len(canonical) > 1:
+            raise ProvenanceError(
+                'Flip-correction provenance is ambiguous: record slots have '
+                'the same journal sequence but conflicting contents.'
+            )
+    _, record = latest[0]
+    state = record.get('state')
+    if state != 'complete':
+        raise ProvenanceError(
+            'Flip-correction provenance is not poolable: latest processing '
+            'state is {!r}, not complete.'.format(state)
+        )
+
+    compatibility_fields = (
+        'package',
+        'version',
+        'git_sha',
+        'classifier_sha256',
+        'chunk_size',
+        'chunk_overlap',
+        'smoothing',
+        'frame_path',
+    )
+    missing = [
+        field for field in compatibility_fields
+        if record.get(field) in (None, '')
+    ]
+    if missing:
+        raise ProvenanceError(
+            'Flip-correction provenance is ambiguous: complete record is '
+            'missing compatibility field(s) {}.'.format(
+                ', '.join(repr(field) for field in missing)
+            )
+        )
+    compatibility = {
+        field: record[field]
+        for field in compatibility_fields
+    }
+    compatibility['state'] = 'complete'
+    return json.dumps(compatibility, sort_keys=True, separators=(',', ':'))
+
+
+def read_flip_correction_policy(path):
+    """Return the effective app flip-correction policy for one extraction."""
+    try:
+        with h5py.File(path, 'r') as f:
+            return _read_flip_correction_policy(f)
+    except ProvenanceError:
+        raise
+    except OSError as error:
+        raise ProvenanceError(
+            'CORRUPT/unreadable extraction {!r}: {}: {}'.format(
+                path, type(error).__name__, error
+            )
+        )
+
+
 def read_pipeline_provenance(path, h5_path='metadata/pipeline'):
     """
     Read the provenance record written by moseq2-extract / moseq2-pca into an h5.
@@ -417,23 +636,32 @@ def read_pipeline_provenance(path, h5_path='metadata/pipeline'):
     h5_path (str): dataset path holding the JSON provenance record.
 
     Returns:
-    provenance (dict): the provenance record, or None when provenance is
-        UNKNOWN because no usable record could be read.
-    """
-    import json
+    provenance (dict): the VALID extraction record augmented in memory with
+        the effective flip-correction policy, or None when the record is ABSENT.
 
-    candidates = [h5_path, 'metadata/extraction/pipeline']
+    Raises:
+    ProvenanceError: when a present record is CORRUPT, when both candidate
+        paths conflict, or when flip-correction state is ambiguous.
+    """
     try:
         with h5py.File(path, 'r') as f:
-            for candidate in candidates:
-                if candidate in f:
-                    raw = f[candidate][()]
-                    if isinstance(raw, bytes):
-                        raw = raw.decode()
-                    return json.loads(raw)
-    except (OSError, ValueError, KeyError):
+            record = _read_extraction_provenance(f, h5_path)
+            flip_policy = _read_flip_correction_policy(f)
+    except ProvenanceError:
+        raise
+    except OSError as error:
+        raise ProvenanceError(
+            'CORRUPT/unreadable extraction {!r}: {}: {}'.format(
+                path, type(error).__name__, error
+            )
+        )
+    if record is None:
         return None
-    return None
+    effective = dict(record)
+    policies = dict(effective.get('policies', {}))
+    policies['flip_correction'] = flip_policy
+    effective['policies'] = policies
+    return effective
 
 
 def describe_provenance(provenance):
@@ -452,7 +680,7 @@ def describe_provenance(provenance):
 #: mirror moseq2_extract.util.EXTRACT_OUTPUT_POLICIES; they are duplicated here
 #: rather than imported so moseq2-viz does not take a runtime dependency on
 #: moseq2-extract just to read a list of strings.
-SCALAR_POOLING_POLICIES = (
+EXTRACTION_POOLING_POLICIES = (
     'scalar_px_to_mm',
     'area_units',
     'background_dropout',
@@ -462,35 +690,7 @@ SCALAR_POOLING_POLICIES = (
     'velocity_3d_px',
 )
 
-
-def provenance_from_model(model):
-    """
-    Pull the pipeline provenance out of a parsed model result.
-
-    moseq2-model writes its record into the pickled result dict rather than an
-    h5, so it cannot be read by :func:`read_pipeline_provenance`.
-
-    Args:
-    model (dict): a model result dict, as returned by `parse_model_results`.
-
-    Returns:
-    provenance (dict): the record, or None when the model has no usable record.
-    """
-    if not isinstance(model, dict):
-        return None
-    record = model.get('pipeline_provenance')
-    return record if isinstance(record, dict) else None
-
-
-class ProvenanceError(ValueError):
-    """
-    Raised when files that are about to be pooled into one analysis were not
-    produced by compatible pipeline versions.
-
-    Subclasses ValueError so existing ``except ValueError`` handlers keep
-    working, but is catchable on its own for callers that want to offer an
-    explicit override.
-    """
+SCALAR_POOLING_POLICIES = EXTRACTION_POOLING_POLICIES + ('flip_correction',)
 
 
 def _provenance_policy_conflicts(records):
@@ -542,7 +742,6 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
     """
     Refuse to pool files that were produced by incompatible pipeline versions.
 
-    This is the enforcing counterpart to :func:`assert_consistent_provenance`.
     It is meant to be called at a pooling boundary -- the point where per-session
     files stop being separate and start being one dataset -- because that is
     where a version mismatch stops being visible and starts being a silently
@@ -579,9 +778,9 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
         stamped file declares cannot be compared, so it is reported as a
         warning; a key some files declare and others do not is a conflict and
         is handled by the normal rules.
-    records (dict): pre-read ``path -> record`` mapping, for callers holding
-        provenance that does not live in an h5 (a pickled model, say). When
-        given, no files are opened.
+    records (dict): optional pre-read ``path -> record`` mapping. When given,
+        no files are opened and effective app processing state must already be
+        represented in each record's policy map.
 
     Returns:
     consistent (bool): True if every file is stamped and all policies agree.
@@ -596,7 +795,12 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
     if not paths:
         return True
 
+    flip_policies = None
     if records is None:
+        # Read flip state even when extraction provenance is ABSENT. Otherwise
+        # two unstamped files could silently mix app-corrected and uncorrected
+        # angle semantics in the all-UNKNOWN warning branch.
+        flip_policies = {p: read_flip_correction_policy(p) for p in paths}
         records = {p: read_pipeline_provenance(p, h5_path) for p in paths}
     unstamped = sorted(p for p, r in records.items() if r is None)
     stamped = {p: r for p, r in records.items() if r is not None}
@@ -615,6 +819,33 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
             + '\n\nReprocess the affected sessions with a single pipeline '
               'version so they agree, or pass allow_mixed=True to override '
               'this check (the mismatch will still be reported as a warning).')
+
+    if flip_policies is not None:
+        by_policy = {}
+        for path, policy in flip_policies.items():
+            by_policy.setdefault(policy, []).append(path)
+        if len(by_policy) > 1:
+            details = []
+            for policy, policy_paths in sorted(by_policy.items()):
+                label = (
+                    'not_applied'
+                    if policy == 'not_applied'
+                    else 'complete correction ({})'.format(
+                        hashlib.sha256(policy.encode()).hexdigest()[:12]
+                    )
+                )
+                details.append(
+                    '  {}:\n{}'.format(
+                        label,
+                        '\n'.join('    ' + path for path in sorted(policy_paths)),
+                    )
+                )
+            return _report(
+                'Refusing to pool files with different flip-correction '
+                'processing policies into {}.\n{}'.format(
+                    context, '\n'.join(details)
+                )
+            )
 
     if stamped and unstamped:
         return _report(
@@ -677,41 +908,3 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
             return False
 
     return True
-
-
-def assert_consistent_provenance(paths, h5_path='metadata/pipeline'):
-    """
-    Warn if a set of files was not all produced by the same pipeline version.
-
-    Mixing files generated before and after a behaviour change is the failure
-    mode version stamping exists to catch: the numbers are silently on different
-    scales or policies. This does not raise, so it can be called defensively.
-
-    Args:
-    paths (list): h5 paths to compare.
-    h5_path (str): dataset path holding the JSON provenance record.
-
-    Returns:
-    consistent (bool): True if every file reports the same policies (and all
-        are stamped), False otherwise.
-    """
-    import warnings
-
-    records = {p: read_pipeline_provenance(p, h5_path) for p in paths}
-    unstamped = [p for p, r in records.items() if r is None]
-    policy_sets = {repr(sorted((r or {}).get('policies', {}).items()))
-                   for r in records.values() if r is not None}
-
-    if unstamped:
-        warnings.warn(
-            f'{len(unstamped)} of {len(paths)} files have no pipeline provenance '
-            'record. Their provenance is UNKNOWN; generation history and '
-            'numerical behaviour cannot be inferred. Regenerate them before '
-            'combining with stamped files.')
-    if len(policy_sets) > 1:
-        warnings.warn(
-            'Files were produced by pipelines with DIFFERENT output policies. '
-            'Combining them mixes incompatible numbers. Per-file provenance:\n  '
-            + '\n  '.join(f'{p}: {describe_provenance(r)}' for p, r in records.items()))
-
-    return not unstamped and len(policy_sets) <= 1

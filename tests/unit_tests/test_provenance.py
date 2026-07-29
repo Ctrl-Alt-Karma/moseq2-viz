@@ -16,10 +16,10 @@ from unittest import TestCase
 
 import h5py
 
-from moseq2_viz.util import (SCALAR_POOLING_POLICIES, ProvenanceError,
+from moseq2_viz.util import (EXTRACTION_POOLING_POLICIES,
+                             SCALAR_POOLING_POLICIES, ProvenanceError,
                              describe_provenance,
                              enforce_consistent_provenance,
-                             provenance_from_model,
                              read_pipeline_provenance)
 
 
@@ -36,13 +36,36 @@ FULL_POLICIES = {
 }
 
 
-def _write_h5(path, provenance=None, h5_path='metadata/pipeline'):
+def _write_h5(path, provenance=None,
+              h5_path='metadata/extraction/pipeline'):
     """Create a minimal h5 with (or without) a provenance record."""
     with h5py.File(path, 'w') as f:
         f.create_dataset('scalars/centroid_x_px', data=[1.0, 2.0, 3.0])
         if provenance is not None:
             f.create_dataset(h5_path, data=json.dumps(provenance))
     return path
+
+
+def _complete_flip_record(classifier='a' * 64, **updates):
+    record = {
+        'package': 'moseq2-app',
+        'version': '0.1.0',
+        'git_sha': 'app-sha',
+        'state': 'complete',
+        'classifier_sha256': classifier,
+        'chunk_size': 4000,
+        'chunk_overlap': 0,
+        'smoothing': 51,
+        'frame_path': 'frames',
+        '_journal_sequence': 1,
+    }
+    record.update(updates)
+    return record
+
+
+def _write_flip_record(path, record, slot='metadata/processing/flip_classifier'):
+    with h5py.File(path, 'a') as f:
+        f.create_dataset(slot, data=json.dumps(record))
 
 
 def _record(**policies):
@@ -193,8 +216,10 @@ class TestRequiredScalarPolicies(TestCase):
         b = _write_h5(join(self.tmp, 'b.h5'), _record(**policies_b))
         return a, b
 
-    def test_the_required_key_set_is_what_extract_declares(self):
-        self.assertEqual(set(SCALAR_POOLING_POLICIES), set(FULL_POLICIES))
+    def test_required_extraction_keys_match_documented_snapshot(self):
+        # Exact cross-repository comparison lives in pipeline-control, where
+        # both locked repositories are required inputs.
+        self.assertEqual(set(EXTRACTION_POOLING_POLICIES), set(FULL_POLICIES))
 
     def test_identical_full_policies_pass_silently(self):
         a, b = self._pair(FULL_POLICIES, FULL_POLICIES)
@@ -206,7 +231,7 @@ class TestRequiredScalarPolicies(TestCase):
 
     def test_every_required_policy_is_actually_compared(self):
         """Flip one policy at a time; each must be caught on its own."""
-        for key in SCALAR_POOLING_POLICIES:
+        for key in EXTRACTION_POOLING_POLICIES:
             other = dict(FULL_POLICIES)
             other[key] = 'something-else'
             a, b = self._pair(FULL_POLICIES, other)
@@ -298,15 +323,6 @@ class TestCrossPackageScope(TestCase):
         self.assertIn('a.h5', message)
         self.assertIn('b.h5', message)
 
-    def test_provenance_from_model_reads_the_pickled_record(self):
-        record = {'package': 'moseq2-model', 'policies': {'sampler_seeding': 'explicit-seed'}}
-        self.assertEqual(provenance_from_model({'pipeline_provenance': record}), record)
-
-    def test_provenance_from_unstamped_model_is_none(self):
-        self.assertIsNone(provenance_from_model({'labels': [], 'keys': []}))
-        self.assertIsNone(provenance_from_model(None))
-
-
 class TestProvenanceReading(TestCase):
 
     def setUp(self):
@@ -315,11 +331,78 @@ class TestProvenanceReading(TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_reads_extraction_path_as_fallback(self):
+    def test_reads_extracts_preferred_path(self):
         path = join(self.tmp, 'extract.h5')
         record = _record(focal_length='pinhole')
         _write_h5(path, record, h5_path='metadata/extraction/pipeline')
-        self.assertEqual(read_pipeline_provenance(path), record)
+        observed = read_pipeline_provenance(path)
+        self.assertEqual(observed['package'], record['package'])
+        self.assertEqual(observed['policies']['focal_length'], 'pinhole')
+        self.assertEqual(observed['policies']['flip_correction'], 'not_applied')
+
+    def test_valid_historical_path_is_supported(self):
+        path = join(self.tmp, 'historical.h5')
+        _write_h5(path, _record(focal_length='pinhole'),
+                  h5_path='metadata/pipeline')
+        self.assertEqual(
+            read_pipeline_provenance(path)['policies']['focal_length'],
+            'pinhole')
+
+    def test_semantically_identical_dual_paths_are_accepted(self):
+        path = join(self.tmp, 'same.h5')
+        record = _record(focal_length='pinhole')
+        _write_h5(path, record)
+        with h5py.File(path, 'a') as f:
+            f.create_dataset('metadata/pipeline', data=json.dumps(record))
+        self.assertEqual(
+            read_pipeline_provenance(path)['policies']['focal_length'],
+            'pinhole')
+
+    def test_conflicting_dual_paths_are_corrupt(self):
+        path = join(self.tmp, 'conflict.h5')
+        _write_h5(path, _record(focal_length='pinhole'))
+        with h5py.File(path, 'a') as f:
+            f.create_dataset(
+                'metadata/pipeline',
+                data=json.dumps(_record(focal_length='small-angle')))
+        with self.assertRaisesRegex(ProvenanceError, 'conflicting records'):
+            read_pipeline_provenance(path)
+
+    def test_truncated_json_is_corrupt(self):
+        path = join(self.tmp, 'truncated.h5')
+        with h5py.File(path, 'w') as f:
+            f.create_dataset('metadata/extraction/pipeline',
+                             data='{"policies": ')
+        with self.assertRaisesRegex(ProvenanceError, 'CORRUPT'):
+            read_pipeline_provenance(path)
+
+    def test_every_corrupt_input_hard_fails_pooling(self):
+        paths = []
+        for name in ('a.h5', 'b.h5'):
+            path = join(self.tmp, name)
+            with h5py.File(path, 'w') as f:
+                f.create_dataset('metadata/extraction/pipeline',
+                                 data='{"policies": ')
+            paths.append(path)
+        with self.assertRaisesRegex(ProvenanceError, 'CORRUPT'):
+            enforce_consistent_provenance(paths)
+
+    def test_one_corrupt_and_one_valid_hard_fails_pooling(self):
+        corrupt = join(self.tmp, 'corrupt.h5')
+        with h5py.File(corrupt, 'w') as f:
+            f.create_dataset('metadata/extraction/pipeline', data='null')
+        valid = _write_h5(
+            join(self.tmp, 'valid.h5'), _record(focal_length='pinhole'))
+        with self.assertRaisesRegex(ProvenanceError, 'object/mapping'):
+            enforce_consistent_provenance([corrupt, valid])
+
+    def test_non_object_json_is_corrupt(self):
+        for i, raw in enumerate(('null', '7', '"text"', '[1, 2]')):
+            path = join(self.tmp, 'non-object-{}.h5'.format(i))
+            with h5py.File(path, 'w') as f:
+                f.create_dataset('metadata/extraction/pipeline', data=raw)
+            with self.assertRaisesRegex(ProvenanceError, 'object/mapping'):
+                read_pipeline_provenance(path)
 
     def test_missing_record_reads_as_none(self):
         path = join(self.tmp, 'plain.h5')
@@ -335,6 +418,90 @@ class TestProvenanceReading(TestCase):
         text = describe_provenance(_record(focal_length='pinhole'))
         self.assertIn('moseq2-extract', text)
         self.assertIn('focal_length=pinhole', text)
+
+
+class TestFlipCorrectionPolicy(TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _path(self, name, provenance=True):
+        record = _record(**FULL_POLICIES) if provenance else None
+        return _write_h5(join(self.tmp, name), record)
+
+    def test_complete_and_not_applied_refuse_to_pool(self):
+        corrected = self._path('corrected.h5')
+        plain = self._path('plain.h5')
+        _write_flip_record(corrected, _complete_flip_record())
+        with self.assertRaisesRegex(ProvenanceError, 'flip-correction'):
+            enforce_consistent_provenance(
+                [corrected, plain],
+                required_policies=SCALAR_POOLING_POLICIES)
+
+    def test_compatible_complete_records_can_pool(self):
+        paths = [self._path('a.h5'), self._path('b.h5')]
+        for path in paths:
+            _write_flip_record(path, _complete_flip_record())
+        self.assertTrue(enforce_consistent_provenance(
+            paths, required_policies=SCALAR_POOLING_POLICIES))
+
+    def test_different_complete_records_refuse_to_pool(self):
+        a = self._path('a.h5')
+        b = self._path('b.h5')
+        _write_flip_record(a, _complete_flip_record(classifier='a' * 64))
+        _write_flip_record(b, _complete_flip_record(classifier='b' * 64))
+        with self.assertRaisesRegex(ProvenanceError, 'flip-correction'):
+            enforce_consistent_provenance([a, b])
+
+    def test_incomplete_and_failed_records_hard_fail(self):
+        for state in ('in_progress', 'failed'):
+            path = self._path(state + '.h5')
+            _write_flip_record(path, _complete_flip_record(state=state))
+            with self.assertRaisesRegex(ProvenanceError, 'not poolable'):
+                enforce_consistent_provenance([path])
+
+    def test_corrupt_flip_record_hard_fails(self):
+        path = self._path('corrupt.h5')
+        with h5py.File(path, 'a') as f:
+            f.create_dataset(
+                'metadata/processing/flip_classifier',
+                data='{"state": ')
+        with self.assertRaisesRegex(ProvenanceError, 'CORRUPT'):
+            enforce_consistent_provenance([path])
+
+    def test_non_mapping_flip_record_hard_fails(self):
+        for i, raw in enumerate(('null', '7', '"text"', '[1, 2]')):
+            path = self._path('non-object-{}.h5'.format(i))
+            with h5py.File(path, 'a') as f:
+                f.create_dataset(
+                    'metadata/processing/flip_classifier', data=raw)
+            with self.assertRaisesRegex(ProvenanceError, 'object/mapping'):
+                enforce_consistent_provenance([path])
+
+    def test_legacy_latch_only_hard_fails(self):
+        path = self._path('legacy.h5')
+        with h5py.File(path, 'a') as f:
+            f.attrs['flip_classifier_applied'] = True
+        with self.assertRaisesRegex(ProvenanceError, 'legacy'):
+            enforce_consistent_provenance([path])
+
+    def test_update_sentinel_hard_fails(self):
+        path = self._path('sentinel.h5')
+        _write_flip_record(path, _complete_flip_record())
+        with h5py.File(path, 'a') as f:
+            f.attrs['flip_classifier_record_update_in_progress'] = True
+        with self.assertRaisesRegex(ProvenanceError, 'sentinel'):
+            enforce_consistent_provenance([path])
+
+    def test_unstamped_corrected_and_plain_still_refuse(self):
+        corrected = self._path('corrected.h5', provenance=False)
+        plain = self._path('plain.h5', provenance=False)
+        _write_flip_record(corrected, _complete_flip_record())
+        with self.assertRaisesRegex(ProvenanceError, 'flip-correction'):
+            enforce_consistent_provenance([corrected, plain])
 
 
 class TestPoolingBoundaryIsGated(TestCase):
