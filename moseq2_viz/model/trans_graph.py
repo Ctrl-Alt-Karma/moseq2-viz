@@ -124,6 +124,30 @@ def get_transitions(label_sequence):
     return transitions, locs
 
 
+def get_state_runs(label_sequence):
+    """
+    Return the run-length-compressed state sequence, INCLUDING the initial state.
+
+    get_transitions() returns only the states at change locations, i.e. the
+    destination of each transition, so it drops the very first state. Building
+    bigrams from that loses the first transition of every session. This helper
+    keeps the first state so consecutive pairs recover every transition.
+
+    Args:
+    label_sequence (np.ndarray): per-frame syllable labels for one session.
+
+    Returns:
+    runs (np.ndarray): the syllable at the start of each contiguous run.
+    """
+
+    arr = np.asarray(deepcopy(label_sequence))
+    if arr.size == 0:
+        return arr
+    change_locs = np.flatnonzero(arr[1:] != arr[:-1]) + 1
+    locs = np.concatenate(([0], change_locs))
+    return arr[locs]
+
+
 def normalize_transition_matrix(init_matrix, normalize):
     """
     Normalize a transition matrix by given criteria.
@@ -197,8 +221,9 @@ def get_transition_matrix(labels, max_syllable=100, normalize='bigram',
         init_matrix = []
 
         for v in tqdm(labels, disable=disable_output, desc='Computing bigram transition probabilities'):
-            # Get syllable transitions
-            transitions = get_transitions(v)[0]
+            # Use the full run sequence (including the first state) so the
+            # first transition of every session is counted.
+            transitions = get_state_runs(v)
 
             trans_mat = n_gram_transition_matrix(transitions, n=2, max_label=max_syllable)
             init_matrix.append(trans_mat)
@@ -209,8 +234,9 @@ def get_transition_matrix(labels, max_syllable=100, normalize='bigram',
         # Compute a transition matrix for each session label list
         all_mats = []
         for v in tqdm(labels, disable=disable_output, desc='Computing bigram transition probabilities'):
-            # Get syllable transitions
-            transitions = get_transitions(v)[0]
+            # Use the full run sequence (including the first state) so the
+            # first transition of every session is counted.
+            transitions = get_state_runs(v)
 
             trans_mat = n_gram_transition_matrix(transitions, n=2, max_label=max_syllable) + smoothing
 
@@ -378,9 +404,13 @@ def make_difference_graphs(trans_mats, usages, group, group_names, usage_kwargs,
                 df_usage = {k: usages[j + i + 1][k] - usages[i][k] for k in range(len(df))}
                 usages.append(df_usage)
 
-                # get node sizes and colors based on usage differences
-                node_size = np.abs(list(df_usage.values()))[:len(graph.nodes)] * usage_scale
-                node_edge_color = ['b' if x > 0 else 'r' for x in df_usage.values()][:len(graph.nodes)]
+                # get node sizes and colors based on usage differences, indexed by
+                # the ACTUAL graph nodes. Edge thresholding can leave a sparse node
+                # set (e.g. [5, 7]); taking the first len(nodes) values of df_usage
+                # instead rendered nodes 5 and 7 using syllables 0 and 1's usages.
+                graph_nodes = list(graph.nodes)
+                node_size = np.abs([df_usage.get(n, 0) for n in graph_nodes]) * usage_scale
+                node_edge_color = ['b' if df_usage.get(n, 0) > 0 else 'r' for n in graph_nodes]
 
                 node_sizes.append(node_size)
                 node_edge_colors.append(node_edge_color)
