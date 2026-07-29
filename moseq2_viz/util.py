@@ -447,6 +447,41 @@ def describe_provenance(provenance):
             f"({provenance.get('written', '?')}) [{policies}]")
 
 
+#: Output policies that change the numbers in an extraction's scalars. Two
+#: extractions pooled into one analysis must agree on all of these. The names
+#: mirror moseq2_extract.util.EXTRACT_OUTPUT_POLICIES; they are duplicated here
+#: rather than imported so moseq2-viz does not take a runtime dependency on
+#: moseq2-extract just to read a list of strings.
+SCALAR_POOLING_POLICIES = (
+    'scalar_px_to_mm',
+    'area_units',
+    'background_dropout',
+    'roi_plane_fit',
+    'hampel_filter',
+    'depth_range_detection',
+    'velocity_3d_px',
+)
+
+
+def provenance_from_model(model):
+    """
+    Pull the pipeline provenance out of a parsed model result.
+
+    moseq2-model writes its record into the pickled result dict rather than an
+    h5, so it cannot be read by :func:`read_pipeline_provenance`.
+
+    Args:
+    model (dict): a model result dict, as returned by `parse_model_results`.
+
+    Returns:
+    provenance (dict): the record, or None if the model predates stamping.
+    """
+    if not isinstance(model, dict):
+        return None
+    record = model.get('pipeline_provenance')
+    return record if isinstance(record, dict) else None
+
+
 class ProvenanceError(ValueError):
     """
     Raised when files that are about to be pooled into one analysis were not
@@ -471,18 +506,28 @@ def _provenance_policy_conflicts(records):
         is missing from some records is a conflict too; the absent value is
         reported as the string '<absent>'.
     """
-    all_keys = set()
-    for record in records.values():
-        all_keys.update((record or {}).get('policies', {}).keys())
+    # Compare within a package, never across. moseq2-extract and moseq2-model
+    # declare entirely different policy keys, so comparing an extraction against
+    # a model would report every key as absent-on-one-side and conflict always.
+    by_package = {}
+    for path, record in records.items():
+        by_package.setdefault((record or {}).get('package', '?'), {})[path] = record
 
     conflicts = {}
-    for key in sorted(all_keys):
-        by_value = {}
-        for path, record in records.items():
-            value = (record or {}).get('policies', {}).get(key, '<absent>')
-            by_value.setdefault(str(value), []).append(path)
-        if len(by_value) > 1:
-            conflicts[key] = by_value
+    for package, group in sorted(by_package.items()):
+        if len(group) < 2:
+            continue
+        all_keys = set()
+        for record in group.values():
+            all_keys.update((record or {}).get('policies', {}).keys())
+
+        for key in sorted(all_keys):
+            by_value = {}
+            for path, record in group.items():
+                value = (record or {}).get('policies', {}).get(key, '<absent>')
+                by_value.setdefault(str(value), []).append(path)
+            if len(by_value) > 1:
+                conflicts[f'{package}:{key}' if len(by_package) > 1 else key] = by_value
     return conflicts
 
 
@@ -502,7 +547,8 @@ def _format_provenance_conflicts(conflicts, records):
 
 
 def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
-                                  allow_mixed=False, context='this analysis'):
+                                  allow_mixed=False, context='this analysis',
+                                  required_policies=None, records=None):
     """
     Refuse to pool files that were produced by incompatible pipeline versions.
 
@@ -526,13 +572,26 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
       allowed, but the user is told the pipeline cannot verify it.
     * **All stamped and agreeing -> silent.**
 
+    Comparison is on the semantic policy tags only. Two files built from
+    different commits agree as long as their declared policies agree, so a
+    documentation-only commit never invalidates otherwise compatible data.
+
     Args:
-    paths (list): h5 paths about to be combined.
+    paths (list): h5 paths about to be combined. Used to label the records and,
+        unless ``records`` is given, to read them.
     h5_path (str): dataset path holding the JSON provenance record.
     allow_mixed (bool): opt out of the hard errors. The mismatch is still
         reported in full, as a loud warning, so it cannot pass unnoticed.
     context (str): short phrase naming what the files are being pooled into,
         used in the message (e.g. 'the scalar dataframe').
+    required_policies (iterable): policy keys that must be established for this
+        kind of pooling (e.g. :data:`SCALAR_POOLING_POLICIES`). A key that no
+        stamped file declares cannot be compared, so it is reported as a
+        warning; a key some files declare and others do not is a conflict and
+        is handled by the normal rules.
+    records (dict): pre-read ``path -> record`` mapping, for callers holding
+        provenance that does not live in an h5 (a pickled model, say). When
+        given, no files are opened.
 
     Returns:
     consistent (bool): True if every file is stamped and all policies agree.
@@ -547,7 +606,8 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
     if not paths:
         return True
 
-    records = {p: read_pipeline_provenance(p, h5_path) for p in paths}
+    if records is None:
+        records = {p: read_pipeline_provenance(p, h5_path) for p in paths}
     unstamped = sorted(p for p, r in records.items() if r is None)
     stamped = {p: r for p, r in records.items() if r is not None}
 
@@ -598,6 +658,23 @@ def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
             'different numerical behaviour, so their scalars are on different '
             'scales or definitions.\n'
             + _format_provenance_conflicts(conflicts, stamped))
+
+    # Every file agrees. Separately check that the policies this kind of pooling
+    # depends on were actually established: a key no stamped file declares was
+    # not compared, so agreement on it has not been shown, only assumed.
+    if required_policies:
+        declared = set()
+        for record in stamped.values():
+            declared.update((record or {}).get('policies', {}).keys())
+        undeclared = [k for k in required_policies if k not in declared]
+        if undeclared:
+            warnings.warn(
+                f'The files being pooled into {context} agree on every policy '
+                'they declare, but none of them declares '
+                + ', '.join(repr(k) for k in undeclared)
+                + '. Those behaviours could not be compared, so compatibility '
+                  'is established only for the policies that are recorded.')
+            return False
 
     return True
 

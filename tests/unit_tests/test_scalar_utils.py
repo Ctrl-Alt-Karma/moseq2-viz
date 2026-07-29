@@ -352,6 +352,40 @@ class TestDeprecatedScalars(TestCase):
         assert 'velocity_3d_px' not in feats
         assert 'velocity_3d_mm' in feats and np.isfinite(feats['velocity_3d_mm']).all()
 
+    def test_downstream_analysis_works_without_the_key(self):
+        """
+        Analysis helpers must not assume velocity_3d_px is present. This walks
+        a scalar dataframe that never had it through the summarising paths.
+        """
+        from moseq2_viz.scalars.util import (compute_all_pdf_data,
+                                             compute_mean_syll_scalar)
+
+        n = 60
+        df = pd.DataFrame({
+            'centroid_x_mm': np.linspace(-40, 40, n),
+            'centroid_y_mm': np.linspace(-30, 30, n),
+            'velocity_2d_px': np.abs(np.sin(np.arange(n))),
+            'velocity_2d_mm': np.abs(np.sin(np.arange(n))) * 1.86,
+            'velocity_3d_mm': np.abs(np.cos(np.arange(n))) * 1.86,
+            'height_ave_mm': np.full(n, 40.0),
+            'area_mm': np.full(n, 1500.0),
+            'group': ['WT'] * (n // 2) + ['5xFAD'] * (n // 2),
+            'uuid': ['u0'] * (n // 2) + ['u1'] * (n // 2),
+            'SubjectName': ['m0'] * (n // 2) + ['m1'] * (n // 2),
+            'SessionName': ['s0'] * (n // 2) + ['s1'] * (n // 2),
+            'labels (usage sort)': np.tile(np.arange(6), n // 6),
+            'syllable index': np.arange(n),
+            'frame index': np.arange(n),
+        })
+        assert 'velocity_3d_px' not in df.columns
+
+        pdfs, groups, uuids, subjects = compute_all_pdf_data(df)
+        assert len(pdfs) == 2 and len(groups) == 2
+
+        out = compute_mean_syll_scalar(df, scalar='velocity_2d_mm')
+        assert 'velocity_2d_mm' in out.columns
+        assert np.isfinite(out['velocity_2d_mm'].dropna()).all()
+
 
 class TestPinholeProjection(TestCase):
     def test_focal_lengths_and_pixel_scale(self):
@@ -378,3 +412,55 @@ class TestPinholeProjection(TestCase):
         from moseq2_viz.scalars.util import convert_pxs_to_mm
         out = convert_pxs_to_mm(np.asarray([[256.0, 212.0]]), (512, 424), (70.6, 60), 673.1)
         np.testing.assert_array_equal(out[0], [0.0, 0.0])
+
+    def test_legacy_force_conversion_reaches_the_pinhole_path(self):
+        """
+        Legacy scalars re-converted through viz must land on the same
+        millimetre scale as a fresh extraction, not the small-angle one.
+        """
+        from moseq2_viz.scalars.util import convert_legacy_scalars
+
+        n = 4
+        # legacy layout: unsuffixed centroid/width/length/area/height_ave
+        legacy = {
+            'centroid_x': np.asarray([256.0, 257.0, 258.0, 259.0]),
+            'centroid_y': np.asarray([212.0, 212.0, 212.0, 212.0]),
+            'width': np.full(n, 20.0),
+            'length': np.full(n, 30.0),
+            'area': np.full(n, 600.0),
+            'height_ave': np.full(n, 25.0),
+            'angle': np.zeros(n),
+        }
+        out = convert_legacy_scalars(legacy, force=True, true_depth=673.1)
+
+        # image centre is the origin; each subsequent pixel is one pinhole step
+        step = 673.1 / (512 / (2 * np.tan(np.deg2rad(70.6 / 2))))
+        np.testing.assert_allclose(step, 1.8616, atol=0.0005)
+        np.testing.assert_allclose(out['centroid_x_mm'],
+                                   np.asarray([0.0, 1.0, 2.0, 3.0]) * step,
+                                   atol=1e-6)
+        np.testing.assert_array_equal(out['centroid_y_mm'], np.zeros(n))
+
+        # the small-angle approximation gives a visibly smaller step, so this
+        # assertion fails if the conversion regresses
+        small_angle_step = 673.1 / (512 / (2 * np.deg2rad(70.6 / 2)))
+        assert abs(step - small_angle_step) > 0.15
+
+    def test_legacy_force_conversion_matches_extract(self):
+        """viz's forced legacy path and extract must agree to floating point."""
+        from moseq2_viz.scalars.util import convert_legacy_scalars
+        from moseq2_extract.util import convert_pxs_to_mm as extract_conv
+
+        xs = np.asarray([0.0, 100.0, 256.0, 511.0])
+        ys = np.asarray([0.0, 90.0, 212.0, 423.0])
+        legacy = {
+            'centroid_x': xs, 'centroid_y': ys,
+            'width': np.full(4, 20.0), 'length': np.full(4, 30.0),
+            'area': np.full(4, 600.0), 'height_ave': np.full(4, 25.0),
+            'angle': np.zeros(4),
+        }
+        out = convert_legacy_scalars(legacy, force=True, true_depth=673.1)
+        expected = extract_conv(np.stack([xs, ys], axis=1), true_depth=673.1)
+
+        np.testing.assert_allclose(out['centroid_x_mm'], expected[:, 0], rtol=1e-12)
+        np.testing.assert_allclose(out['centroid_y_mm'], expected[:, 1], rtol=1e-12)
