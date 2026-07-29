@@ -447,6 +447,161 @@ def describe_provenance(provenance):
             f"({provenance.get('written', '?')}) [{policies}]")
 
 
+class ProvenanceError(ValueError):
+    """
+    Raised when files that are about to be pooled into one analysis were not
+    produced by compatible pipeline versions.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working, but is catchable on its own for callers that want to offer an
+    explicit override.
+    """
+
+
+def _provenance_policy_conflicts(records):
+    """
+    Find output policies that disagree across a set of provenance records.
+
+    Args:
+    records (dict): mapping of file path -> provenance record (never None).
+
+    Returns:
+    conflicts (dict): mapping of policy key -> {policy value: [paths]}, for
+        every key whose value is not identical across all records. A key that
+        is missing from some records is a conflict too; the absent value is
+        reported as the string '<absent>'.
+    """
+    all_keys = set()
+    for record in records.values():
+        all_keys.update((record or {}).get('policies', {}).keys())
+
+    conflicts = {}
+    for key in sorted(all_keys):
+        by_value = {}
+        for path, record in records.items():
+            value = (record or {}).get('policies', {}).get(key, '<absent>')
+            by_value.setdefault(str(value), []).append(path)
+        if len(by_value) > 1:
+            conflicts[key] = by_value
+    return conflicts
+
+
+def _format_provenance_conflicts(conflicts, records):
+    """Render a policy-conflict report that names the keys and the files."""
+    lines = []
+    for key, by_value in conflicts.items():
+        lines.append(f"  policy '{key}' disagrees:")
+        for value, paths in sorted(by_value.items()):
+            lines.append(f"    {value!r}:")
+            for path in sorted(paths):
+                lines.append(f"      {path}")
+    lines.append('  per-file provenance:')
+    for path, record in sorted(records.items()):
+        lines.append(f'    {path}: {describe_provenance(record)}')
+    return '\n'.join(lines)
+
+
+def enforce_consistent_provenance(paths, h5_path='metadata/pipeline',
+                                  allow_mixed=False, context='this analysis'):
+    """
+    Refuse to pool files that were produced by incompatible pipeline versions.
+
+    This is the enforcing counterpart to :func:`assert_consistent_provenance`.
+    It is meant to be called at a pooling boundary -- the point where per-session
+    files stop being separate and start being one dataset -- because that is
+    where a version mismatch stops being visible and starts being a silently
+    wrong number.
+
+    The rules, from most to least severe:
+
+    * **Conflicting policies -> error.** Two stamped files declare different
+      values for the same output policy (e.g. one was extracted with the
+      small-angle focal length and one with the pinhole projection). Their
+      millimetre scalars are on different scales; pooling them is never correct.
+    * **Stamped mixed with unstamped -> error.** An unstamped file predates
+      version stamping, so its policies are unknown and cannot be assumed to
+      match the stamped ones. This is the common half-reprocessed-dataset case.
+    * **All unstamped -> warning.** Every file predates stamping. They are
+      probably mutually consistent (all produced by the old code), so this is
+      allowed, but the user is told the pipeline cannot verify it.
+    * **All stamped and agreeing -> silent.**
+
+    Args:
+    paths (list): h5 paths about to be combined.
+    h5_path (str): dataset path holding the JSON provenance record.
+    allow_mixed (bool): opt out of the hard errors. The mismatch is still
+        reported in full, as a loud warning, so it cannot pass unnoticed.
+    context (str): short phrase naming what the files are being pooled into,
+        used in the message (e.g. 'the scalar dataframe').
+
+    Returns:
+    consistent (bool): True if every file is stamped and all policies agree.
+
+    Raises:
+    ProvenanceError: on conflicting policies, or on a stamped/unstamped mix,
+        unless ``allow_mixed`` is set.
+    """
+    import warnings
+
+    paths = list(paths)
+    if not paths:
+        return True
+
+    records = {p: read_pipeline_provenance(p, h5_path) for p in paths}
+    unstamped = sorted(p for p, r in records.items() if r is None)
+    stamped = {p: r for p, r in records.items() if r is not None}
+
+    def _report(message):
+        if allow_mixed:
+            warnings.warn(
+                message
+                + '\n\nallow_mixed=True was set, so this is being allowed. The '
+                  'numbers below are being combined despite being known to be '
+                  'incompatible. Results should not be trusted until the '
+                  'affected sessions are reprocessed with one pipeline version.')
+            return False
+        raise ProvenanceError(
+            message
+            + '\n\nReprocess the affected sessions with a single pipeline '
+              'version so they agree, or pass allow_mixed=True to override '
+              'this check (the mismatch will still be reported as a warning).')
+
+    if stamped and unstamped:
+        return _report(
+            f'Refusing to pool files with mixed provenance into {context}.\n'
+            f'{len(stamped)} of {len(paths)} files carry a pipeline provenance '
+            f'record and {len(unstamped)} do not. Unstamped files were produced '
+            'before version stamping existed, so their output policies are '
+            'unknown and cannot be assumed to match.\n'
+            '  unstamped:\n'
+            + '\n'.join(f'    {p}' for p in unstamped)
+            + '\n  stamped:\n'
+            + '\n'.join(f'    {p}: {describe_provenance(r)}'
+                        for p, r in sorted(stamped.items())))
+
+    if not stamped:
+        warnings.warn(
+            f'None of the {len(paths)} files being pooled into {context} carry '
+            'a pipeline provenance record; they all predate version stamping. '
+            'They are most likely mutually consistent, but the pipeline cannot '
+            'verify that. Reprocess them to get a verifiable record.')
+        return False
+
+    conflicts = _provenance_policy_conflicts(stamped)
+    if conflicts:
+        keys = ', '.join(repr(k) for k in conflicts)
+        return _report(
+            f'Refusing to pool files with conflicting output policies into '
+            f'{context}.\nThe following policies disagree across the '
+            f'{len(stamped)} files: {keys}.\n'
+            'Files that disagree on a policy were produced by code with '
+            'different numerical behaviour, so their scalars are on different '
+            'scales or definitions.\n'
+            + _format_provenance_conflicts(conflicts, stamped))
+
+    return True
+
+
 def assert_consistent_provenance(paths, h5_path='metadata/pipeline'):
     """
     Warn if a set of files was not all produced by the same pipeline version.

@@ -13,7 +13,8 @@ from collections import defaultdict
 from cytoolz import valmap, get, merge, keyfilter
 from moseq2_viz.model.util import get_transitions, prepare_model_dataframe
 from moseq2_viz.util import (h5_to_dict, strided_app, h5_filepath_from_sorted,
-                             get_timestamps_from_h5, parse_index)
+                             get_timestamps_from_h5, parse_index,
+                             enforce_consistent_provenance)
 
 
 def _star_itemmap(func, d):
@@ -41,8 +42,10 @@ def convert_pxs_to_mm(coords, resolution=(512, 424), field_of_view=(70.6, 60), t
     
     Args:
     coords (list): list of [x,y] pixel coordinate lists.
-    resolution (tuple): video frame size.
-    field_of_view (tuple): camera focal lengths.
+    resolution (tuple): video frame size in pixels, (width, height).
+    field_of_view (tuple): camera angular field of view in DEGREES, (horizontal,
+        vertical). These are view angles, not focal lengths -- the focal lengths
+        are derived from them below. Passing focal lengths here would be wrong.
     true_depth (float): detected distance between depth camera and bucket floor.
 
     Returns:
@@ -74,6 +77,72 @@ def convert_pxs_to_mm(coords, resolution=(512, 424), field_of_view=(70.6, 60), t
     return new_coords
 
 
+# Scalars that must not be used for analysis, mapped to why and what to use.
+# velocity_3d_px combined pixels-per-frame x/y with millimetres-per-frame z
+# under one square root -- sqrt(px^2 + px^2 + mm^2) -- so it has no coherent
+# physical unit. Legacy files still contain numeric values for it; they are
+# plausible-looking but meaningless, so requesting it is an error rather than a
+# warning.
+DEPRECATED_SCALARS = {
+    'velocity_3d_px': (
+        "velocity_3d_px mixed units: its x/y terms are pixels-per-frame while "
+        "its z term (from height_ave_mm) is millimetres-per-frame, so the value "
+        "has no coherent physical unit. Use 'velocity_3d_mm' for 3D speed (all "
+        "axes in mm), 'velocity_2d_mm' for horizontal speed in mm, or "
+        "'velocity_2d_px' for horizontal speed in pixels."
+    ),
+}
+
+
+def check_scalar_is_usable(scalar):
+    """
+    Raise if a scalar is deprecated and must not be used for analysis.
+
+    Args:
+    scalar (str): scalar column name being requested.
+
+    Raises:
+    ValueError: if the scalar is in DEPRECATED_SCALARS.
+    """
+
+    if scalar in DEPRECATED_SCALARS:
+        raise ValueError(DEPRECATED_SCALARS[scalar])
+
+
+def drop_deprecated_scalars(scalars, warn=True):
+    """
+    Remove deprecated scalars from a collection of scalar names or a DataFrame.
+
+    Legacy files still carry numeric values for these columns. Silently keeping
+    them lets an invalid quantity reach an analysis; silently rewriting the file
+    would destroy provenance. Dropping them at read time with a warning is the
+    middle path.
+
+    Args:
+    scalars (pd.DataFrame or iterable of str): scalar table or column names.
+    warn (bool): emit a warning naming what was dropped.
+
+    Returns:
+    The same type as the input, without deprecated scalars.
+    """
+
+    if isinstance(scalars, pd.DataFrame):
+        present = [c for c in scalars.columns if c in DEPRECATED_SCALARS]
+        if present and warn:
+            warnings.warn(
+                'Dropping deprecated scalar(s) %s from this dataset. %s'
+                % (present, ' '.join(DEPRECATED_SCALARS[c] for c in present)))
+        return scalars.drop(columns=present) if present else scalars
+
+    names = list(scalars)
+    present = [n for n in names if n in DEPRECATED_SCALARS]
+    if present and warn:
+        warnings.warn(
+            'Ignoring deprecated scalar(s) %s. %s'
+            % (present, ' '.join(DEPRECATED_SCALARS[c] for c in present)))
+    return [n for n in names if n not in DEPRECATED_SCALARS]
+
+
 def is_legacy(features: dict):
     """
     Check a dictionary of features to see if they correspond with an older version of moseq.
@@ -100,8 +169,10 @@ def generate_empty_feature_dict(nframes) -> dict:
     (dict): dictionary feature to numpy 0 arrays of length nframes key-value pairs.
     """
 
+    # velocity_3d_px is deliberately absent: it mixed pixel-unit x/y with
+    # millimetre-unit z under one square root (see DEPRECATED_SCALARS).
     features = (
-        'centroid_x_px', 'centroid_y_px', 'velocity_2d_px', 'velocity_3d_px',
+        'centroid_x_px', 'centroid_y_px', 'velocity_2d_px',
         'width_px', 'length_px', 'area_px', 'centroid_x_mm', 'centroid_y_mm',
         'velocity_2d_mm', 'velocity_3d_mm', 'width_mm', 'length_mm', 'area_mm',
         'height_ave_mm', 'angle', 'velocity_theta'
@@ -186,8 +257,11 @@ def convert_legacy_scalars(old_features, force: bool = False, true_depth: float 
         vel_z = np.diff(np.concatenate((features['height_ave_mm'][:1], features['height_ave_mm'])))
 
         features['velocity_2d_px'] = np.hypot(vel_x, vel_y)
-        features['velocity_3d_px'] = np.sqrt(
-            np.square(vel_x)+np.square(vel_y)+np.square(vel_z))
+        # NOTE: velocity_3d_px is deliberately NOT produced. vel_x/vel_y are
+        # pixels-per-frame while vel_z is millimetres-per-frame (height_ave_mm
+        # never passes through px_to_mm), so sqrt(px^2 + px^2 + mm^2) mixes units
+        # and has no coherent physical meaning. Use velocity_3d_mm (all mm) or
+        # velocity_2d_px (all pixels). Matches moseq2_extract.extract.proc.
 
         vel_x = np.diff(np.concatenate((features['centroid_x_mm'][:1], features['centroid_x_mm'])))
         vel_y = np.diff(np.concatenate((features['centroid_y_mm'][:1], features['centroid_y_mm'])))
@@ -201,17 +275,29 @@ def convert_legacy_scalars(old_features, force: bool = False, true_depth: float 
     return features
 
 
-def get_scalar_map(index, fill_nans=True, force_conversion=False):
+def get_scalar_map(index, fill_nans=True, force_conversion=False,
+                   allow_mixed_provenance=False):
     """
     Return a dictionary of scalar values loaded from an index dictionary.
+
+    Like :func:`scalars_to_dataframe`, this is a pooling boundary -- every
+    session in the index ends up in one structure -- so the pipeline provenance
+    of the extractions is checked here as well.
 
     Args:
     index (dict): dictionary of index file contents.
     fill_nans (bool): boolean flag that indicates whether to replace NaN values with 0.
     force_conversion (bool): boolean flag that forces the conversion of centroid_[xy]_px into mm.
+    allow_mixed_provenance (bool): pool the sessions even if their pipeline
+        provenance is inconsistent, reporting the mismatch as a loud warning.
 
     Returns:
     scalar_map (dict): dictionary of all the scalar values acquired after extraction.
+
+    Raises:
+    moseq2_viz.util.ProvenanceError: if the extractions declare conflicting
+        output policies, or mix stamped and unstamped files, and
+        ``allow_mixed_provenance`` is not set.
     """
 
     scalar_map = {}
@@ -222,6 +308,11 @@ def get_scalar_map(index, fill_nans=True, force_conversion=False):
     except AttributeError:
         # index['files'] was not loaded as a dictionary
         iter_items = enumerate(index['files'])
+    iter_items = list(iter_items)
+
+    enforce_consistent_provenance([v['path'][0] for _, v in iter_items],
+                                  allow_mixed=allow_mixed_provenance,
+                                  context='the scalar map')
 
     for i, v in iter_items:
         if isinstance(index['files'], list):
@@ -234,6 +325,10 @@ def get_scalar_map(index, fill_nans=True, force_conversion=False):
 
         if conv_scalars is not None:
             scalars = conv_scalars
+
+        # legacy extractions on disk still carry the mixed-unit velocity_3d_px;
+        # drop it here so it cannot reach an analysis through this path either
+        scalars = drop_deprecated_scalars(scalars)
 
         idx = score_idx[uuid]
         scalar_map[uuid] = {}
@@ -400,9 +495,17 @@ def compute_mouse_dist_to_center(roi, centroid_x_px, centroid_y_px):
 
 
 def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'SubjectName', 'StartTime'],
-                         disable_output=False, force_conversion=True, model_path=None):
+                         disable_output=False, force_conversion=True, model_path=None,
+                         allow_mixed_provenance=False):
     """
     Generate a dataframe containing scalar values for all sessions and the dataframe will include syllable information when model_path in not None.
+
+    This is the pooling boundary: after this call the per-session extractions are
+    one dataset and a version mismatch between them is no longer visible. The
+    provenance of every extraction is therefore checked here, and pooling is
+    refused if the files were produced by pipelines with different output
+    policies, or if stamped and unstamped files are mixed. See
+    :func:`moseq2_viz.util.enforce_consistent_provenance`.
 
     Args:
     index (dict): a sorted_index dictionary generated by `parse_index` or `get_sorted_index`
@@ -410,9 +513,18 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
     disable_output (bool): boolean flag that indicates whether to show tqdm output.
     force_conversion (bool): boolean flag that forces the conversion of centroid_[xy]_px into mm.
     model_path (str): path to model object to pull labels from and include in the dataframe
+    allow_mixed_provenance (bool): pool the sessions even if their pipeline
+        provenance is inconsistent. The mismatch is still reported as a loud
+        warning. Only useful when you have independently established that the
+        difference does not affect the scalars you care about.
 
     Returns:
     scalar_df (pandas DataFrame): DataFrame of loaded scalar values with their selected metadata.
+
+    Raises:
+    moseq2_viz.util.ProvenanceError: if the extractions being pooled declare
+        conflicting output policies, or mix stamped and unstamped files, and
+        ``allow_mixed_provenance`` is not set.
     """
     warnings.filterwarnings('ignore', '', FutureWarning)
 
@@ -429,6 +541,14 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
     # check if files is dictionary from sorted_index or list from unsorted index, then sort
     if isinstance(index['files'], list):
         _, index = parse_index(index)
+
+    # Provenance gate. Check the extractions that will actually be pooled -- the
+    # same UUID filter the loop below applies -- before loading any of them, so a
+    # mismatch fails immediately rather than after minutes of I/O.
+    pooled_paths = [h5_filepath_from_sorted(v) for k, v in index['files'].items()
+                    if not has_model or k in model_uuids]
+    enforce_consistent_provenance(pooled_paths, allow_mixed=allow_mixed_provenance,
+                                  context='the scalar dataframe')
 
     dfs = []
     # Iterate through index file session info and paths
@@ -509,6 +629,10 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
 
     # return scalar_dict
     scalar_df = pd.concat(dfs, ignore_index=True)
+    # Legacy extractions still carry numeric velocity_3d_px values that mix
+    # pixel and millimetre units. Drop them here so they cannot silently reach
+    # an analysis; the underlying file is left untouched.
+    scalar_df = drop_deprecated_scalars(scalar_df)
     return scalar_df
 
 
