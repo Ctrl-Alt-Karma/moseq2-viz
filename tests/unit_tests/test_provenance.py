@@ -16,9 +16,24 @@ from unittest import TestCase
 
 import h5py
 
-from moseq2_viz.util import (ProvenanceError, describe_provenance,
+from moseq2_viz.util import (SCALAR_POOLING_POLICIES, ProvenanceError,
+                             describe_provenance,
                              enforce_consistent_provenance,
+                             provenance_from_model,
                              read_pipeline_provenance)
+
+
+#: a full, self-consistent extraction policy map, matching the key set in
+#: moseq2_extract.util.EXTRACT_OUTPUT_POLICIES
+FULL_POLICIES = {
+    'scalar_px_to_mm': 'pinhole',
+    'area_units': 'mm2-xy-product',
+    'background_dropout': 'masked',
+    'roi_plane_fit': 'lstsq-inlier-refit',
+    'hampel_filter': 'mad-threshold-both-axes',
+    'depth_range_detection': 'histogram-mode',
+    'velocity_3d_px': 'invalid-mixed-units-omitted',
+}
 
 
 def _write_h5(path, provenance=None, h5_path='metadata/pipeline'):
@@ -159,6 +174,142 @@ class TestProvenanceGate(TestCase):
 
     def test_provenance_error_is_a_value_error(self):
         self.assertTrue(issubclass(ProvenanceError, ValueError))
+
+
+class TestRequiredScalarPolicies(TestCase):
+    """
+    The policies that must be established before extraction scalars are pooled.
+    Each of these changes the numbers, so agreement on it is load-bearing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _pair(self, policies_a, policies_b):
+        a = _write_h5(join(self.tmp, 'a.h5'), _record(**policies_a))
+        b = _write_h5(join(self.tmp, 'b.h5'), _record(**policies_b))
+        return a, b
+
+    def test_the_required_key_set_is_what_extract_declares(self):
+        self.assertEqual(set(SCALAR_POOLING_POLICIES), set(FULL_POLICIES))
+
+    def test_identical_full_policies_pass_silently(self):
+        a, b = self._pair(FULL_POLICIES, FULL_POLICIES)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            self.assertTrue(enforce_consistent_provenance(
+                [a, b], required_policies=SCALAR_POOLING_POLICIES))
+        self.assertEqual([str(w.message) for w in caught], [])
+
+    def test_every_required_policy_is_actually_compared(self):
+        """Flip one policy at a time; each must be caught on its own."""
+        for key in SCALAR_POOLING_POLICIES:
+            other = dict(FULL_POLICIES)
+            other[key] = 'something-else'
+            a, b = self._pair(FULL_POLICIES, other)
+            with self.assertRaises(ProvenanceError, msg=f'{key} was not compared') as ctx:
+                enforce_consistent_provenance(
+                    [a, b], required_policies=SCALAR_POOLING_POLICIES)
+            message = str(ctx.exception)
+            self.assertIn(repr(key), message)
+            self.assertIn(str(FULL_POLICIES[key]), message)
+            self.assertIn('something-else', message)
+            self.assertIn(a, message)
+            self.assertIn(b, message)
+
+    def test_pinhole_plus_small_angle_fails(self):
+        other = dict(FULL_POLICIES, scalar_px_to_mm='small-angle')
+        a, b = self._pair(FULL_POLICIES, other)
+        with self.assertRaises(ProvenanceError) as ctx:
+            enforce_consistent_provenance([a, b],
+                                          required_policies=SCALAR_POOLING_POLICIES)
+        self.assertIn('pinhole', str(ctx.exception))
+        self.assertIn('small-angle', str(ctx.exception))
+
+    def test_different_area_policies_fail(self):
+        other = dict(FULL_POLICIES, area_units='linear-mm-per-px')
+        a, b = self._pair(FULL_POLICIES, other)
+        with self.assertRaises(ProvenanceError) as ctx:
+            enforce_consistent_provenance([a, b],
+                                          required_policies=SCALAR_POOLING_POLICIES)
+        self.assertIn("'area_units'", str(ctx.exception))
+
+    def test_agreeing_but_incomplete_policies_warn(self):
+        """
+        Files that agree on everything they declare, but never declare a
+        required policy, have not been shown to be compatible on it.
+        """
+        partial = {'scalar_px_to_mm': 'pinhole'}
+        a, b = self._pair(partial, partial)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            self.assertFalse(enforce_consistent_provenance(
+                [a, b], required_policies=SCALAR_POOLING_POLICIES))
+        message = str(caught[0].message)
+        self.assertIn("'area_units'", message)
+        self.assertNotIn("'scalar_px_to_mm'", message)
+
+    def test_different_git_sha_with_same_policies_is_fine(self):
+        """A documentation-only commit must not invalidate compatible data."""
+        a = _write_h5(join(self.tmp, 'a.h5'),
+                      dict(_record(**FULL_POLICIES), git_sha='1111111111'))
+        b = _write_h5(join(self.tmp, 'b.h5'),
+                      dict(_record(**FULL_POLICIES), git_sha='2222222222',
+                           version='1.3.0', written='2026-08-01T00:00:00'))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            self.assertTrue(enforce_consistent_provenance(
+                [a, b], required_policies=SCALAR_POOLING_POLICIES))
+        self.assertEqual([str(w.message) for w in caught], [])
+
+
+class TestCrossPackageComparison(TestCase):
+    """
+    PCA and model records declare disjoint policy keys. Comparing them against
+    each other key-by-key would report every key as absent-on-one-side, so
+    comparison has to be grouped by package.
+    """
+
+    def test_disjoint_packages_do_not_conflict(self):
+        pca = {'package': 'moseq2-pca', 'version': '1.0',
+               'policies': {'changepoint_sigma': '1.3', 'fps_source': 'median'}}
+        model = {'package': 'moseq2-model', 'version': '1.0',
+                 'policies': {'sampler_seeding': 'explicit-seed'}}
+        records = {'scores.h5': pca, 'model.p': model}
+        self.assertTrue(enforce_consistent_provenance(list(records), records=records))
+
+    def test_two_files_of_the_same_package_still_conflict(self):
+        records = {
+            'a.h5': {'package': 'moseq2-pca', 'policies': {'changepoint_sigma': '1.3'}},
+            'b.h5': {'package': 'moseq2-pca', 'policies': {'changepoint_sigma': '2.0'}},
+            'model.p': {'package': 'moseq2-model', 'policies': {'sampler_seeding': 'explicit-seed'}},
+        }
+        with self.assertRaises(ProvenanceError) as ctx:
+            enforce_consistent_provenance(list(records), records=records)
+        message = str(ctx.exception)
+        self.assertIn('changepoint_sigma', message)
+        self.assertIn('a.h5', message)
+        self.assertIn('b.h5', message)
+
+    def test_unstamped_model_against_stamped_pca_fails(self):
+        records = {
+            'scores.h5': {'package': 'moseq2-pca', 'policies': {'fps_source': 'median'}},
+            'model.p': None,
+        }
+        with self.assertRaises(ProvenanceError) as ctx:
+            enforce_consistent_provenance(list(records), records=records)
+        self.assertIn('model.p', str(ctx.exception))
+
+    def test_provenance_from_model_reads_the_pickled_record(self):
+        record = {'package': 'moseq2-model', 'policies': {'sampler_seeding': 'explicit-seed'}}
+        self.assertEqual(provenance_from_model({'pipeline_provenance': record}), record)
+
+    def test_provenance_from_unstamped_model_is_none(self):
+        self.assertIsNone(provenance_from_model({'labels': [], 'keys': []}))
+        self.assertIsNone(provenance_from_model(None))
 
 
 class TestProvenanceReading(TestCase):

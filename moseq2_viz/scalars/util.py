@@ -14,7 +14,8 @@ from cytoolz import valmap, get, merge, keyfilter
 from moseq2_viz.model.util import get_transitions, prepare_model_dataframe
 from moseq2_viz.util import (h5_to_dict, strided_app, h5_filepath_from_sorted,
                              get_timestamps_from_h5, parse_index,
-                             enforce_consistent_provenance)
+                             enforce_consistent_provenance, read_pipeline_provenance,
+                             provenance_from_model, SCALAR_POOLING_POLICIES)
 
 
 def _star_itemmap(func, d):
@@ -312,7 +313,8 @@ def get_scalar_map(index, fill_nans=True, force_conversion=False,
 
     enforce_consistent_provenance([v['path'][0] for _, v in iter_items],
                                   allow_mixed=allow_mixed_provenance,
-                                  context='the scalar map')
+                                  context='the scalar map',
+                                  required_policies=SCALAR_POOLING_POLICIES)
 
     for i, v in iter_items:
         if isinstance(index['files'], list):
@@ -531,12 +533,20 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
     has_model = False # indicator for whether users inputted a model_path to load syllable labels from
     model_uuids = None
     model_type = ''
+    model_provenance = None
     if model_path is not None and exists(model_path):
         labels_df = prepare_model_dataframe(model_path, index['pca_path']).set_index('uuid')
         model_type = labels_df['model_type'].unique()[0]
         has_model = True
         # loading the session uuids that the model was trained on
         model_uuids = labels_df.reset_index().uuid.unique()
+        try:
+            from moseq2_viz.model.util import parse_model_results
+            model_provenance = provenance_from_model(parse_model_results(model_path))
+        except Exception:
+            # the model's own provenance is a nice-to-have; failing to read it
+            # must not stop the scalars from being built
+            model_provenance = None
 
     # check if files is dictionary from sorted_index or list from unsorted index, then sort
     if isinstance(index['files'], list):
@@ -548,7 +558,25 @@ def scalars_to_dataframe(index: dict, include_keys: list = ['SessionName', 'Subj
     pooled_paths = [h5_filepath_from_sorted(v) for k, v in index['files'].items()
                     if not has_model or k in model_uuids]
     enforce_consistent_provenance(pooled_paths, allow_mixed=allow_mixed_provenance,
-                                  context='the scalar dataframe')
+                                  context='the scalar dataframe',
+                                  required_policies=SCALAR_POOLING_POLICIES)
+
+    # When a model is being joined onto the scalars, the PC scores and the model
+    # are part of the same analysis and carry their own policy maps. They are
+    # different packages with different policy keys, so they are compared
+    # against each other, not against the extractions.
+    if has_model:
+        upstream = {}
+        pca_path = index.get('pca_path')
+        if pca_path is not None and exists(pca_path):
+            upstream[pca_path] = read_pipeline_provenance(pca_path)
+        if model_provenance is not None:
+            upstream[str(model_path)] = model_provenance
+        if len(upstream) > 1:
+            enforce_consistent_provenance(
+                list(upstream), records=upstream,
+                allow_mixed=allow_mixed_provenance,
+                context='the modelled scalar dataframe')
 
     dfs = []
     # Iterate through index file session info and paths
