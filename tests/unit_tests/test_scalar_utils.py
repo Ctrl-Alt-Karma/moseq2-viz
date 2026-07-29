@@ -38,27 +38,44 @@ class TestScalarUtils(TestCase):
             assert all(np.isnan(v)) == False
 
     def test_convert_pxs_to_mm(self):
-        coords = np.asarray([[0, 0], [256, 212],[512, 424]])
+        # NOTE: this test previously recomputed the production formula in its own
+        # body and asserted the two matched, so it would have passed for ANY
+        # focal-length formula -- including the small-angle approximation it was
+        # actually pinning. Assert against independently derived values instead.
+        coords = np.asarray([[0, 0], [256, 212], [512, 424]])
         resolution = (512, 424)
         field_of_view = (70.6, 60)
         true_depth = 673.1
 
-        cx = resolution[0] // 2
-        cy = resolution[1] // 2
-
-        xhat = coords[:, 0] - cx
-        yhat = coords[:, 1] - cy
-
-        fw = resolution[0] / (2 * np.deg2rad(field_of_view[0] / 2))
-        fh = resolution[1] / (2 * np.deg2rad(field_of_view[1] / 2))
-
-        new_coords = np.zeros_like(coords)
-        new_coords[:, 0] = true_depth * xhat / fw
-        new_coords[:, 1] = true_depth * yhat / fh
-
         test_coords = convert_pxs_to_mm(coords, resolution, field_of_view, true_depth)
-        np.testing.assert_array_equal(new_coords, test_coords)
-        assert np.isnan(test_coords).all() == False
+
+        # pinhole projection: f = (resolution / 2) / tan(fov / 2)
+        expected = np.asarray([[-476, -388], [0, 0], [476, 388]])
+        np.testing.assert_array_equal(test_coords, expected)
+        assert not np.isnan(test_coords).any()
+
+    def test_convert_pxs_to_mm_matches_camera_intrinsics(self):
+        # The implied focal lengths must be consistent with the Kinect2's
+        # factory-calibrated depth intrinsics (fx = fy ~= 368 at 512x424).
+        # The small-angle approximation gave fx=415.5 / fy=404.9, i.e. 10-13%
+        # high, which underestimated every millimetre displacement.
+        resolution, field_of_view = (512, 424), (70.6, 60)
+        expected_fw = resolution[0] / (2 * np.tan(np.deg2rad(field_of_view[0] / 2)))
+        expected_fh = resolution[1] / (2 * np.tan(np.deg2rad(field_of_view[1] / 2)))
+
+        # recover the per-pixel scale from a known one-pixel offset
+        true_depth = 673.1
+        base = np.asarray([[256.0, 212.0]])
+        shifted = np.asarray([[257.0, 213.0]])
+        step = (convert_pxs_to_mm(shifted, resolution, field_of_view, true_depth)
+                - convert_pxs_to_mm(base, resolution, field_of_view, true_depth))[0]
+
+        np.testing.assert_allclose(step[0], true_depth / expected_fw, rtol=1e-6)
+        np.testing.assert_allclose(step[1], true_depth / expected_fh, rtol=1e-6)
+
+        # and those focal lengths sit within 2% of the factory intrinsics
+        assert abs(expected_fw - 368.1) / 368.1 < 0.02
+        assert abs(expected_fh - 368.1) / 368.1 < 0.02
 
     def test_is_legacy(self):
         true_test = {'centroid_x': [1], 'area': 2}
