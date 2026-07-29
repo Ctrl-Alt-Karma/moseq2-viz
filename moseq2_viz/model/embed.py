@@ -8,6 +8,7 @@ from itertools import product
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from moseq2_viz.model.util import get_Xy_values
+from moseq2_viz.util import validate_scalar_dataframe
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 
 
@@ -93,6 +94,8 @@ def run_2d_scalar_embedding(
     fig (matplotlib figure): figure containing plotted 2d embedding.
     ax (matplonlib axes): axes instance for plotted figure.
     """
+
+    validate_scalar_dataframe(scalar_df)
 
     # Initialize embedding method
     if embedding.lower() == "lda":

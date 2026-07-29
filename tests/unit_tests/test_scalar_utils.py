@@ -1,8 +1,13 @@
 import joblib
 import unittest
+import os
+import json
+import tempfile
+import warnings
+import h5py
 import numpy as np
 import pandas as pd
-from unittest import TestCase
+from unittest import TestCase, mock
 from cytoolz import merge_with
 from moseq2_viz.util import parse_index, read_yaml
 from moseq2_viz.model.util import parse_model_results, h5_to_dict
@@ -38,27 +43,50 @@ class TestScalarUtils(TestCase):
             assert all(np.isnan(v)) == False
 
     def test_convert_pxs_to_mm(self):
-        coords = np.asarray([[0, 0], [256, 212],[512, 424]])
+        # NOTE: this test previously recomputed the production formula in its own
+        # body and asserted the two matched, so it would have passed for ANY
+        # focal-length formula -- including the small-angle approximation it was
+        # actually pinning. Assert against independently derived values instead.
+        coords = np.asarray([[0, 0], [256, 212], [512, 424]])
         resolution = (512, 424)
         field_of_view = (70.6, 60)
         true_depth = 673.1
 
-        cx = resolution[0] // 2
-        cy = resolution[1] // 2
-
-        xhat = coords[:, 0] - cx
-        yhat = coords[:, 1] - cy
-
-        fw = resolution[0] / (2 * np.deg2rad(field_of_view[0] / 2))
-        fh = resolution[1] / (2 * np.deg2rad(field_of_view[1] / 2))
-
-        new_coords = np.zeros_like(coords)
-        new_coords[:, 0] = true_depth * xhat / fw
-        new_coords[:, 1] = true_depth * yhat / fh
-
         test_coords = convert_pxs_to_mm(coords, resolution, field_of_view, true_depth)
-        np.testing.assert_array_equal(new_coords, test_coords)
-        assert np.isnan(test_coords).all() == False
+
+        # pinhole projection: f = (resolution / 2) / tan(fov / 2).
+        # Integer pixel inputs must still retain fractional millimetres.
+        expected = np.asarray([
+            [-476.58136532, -388.61446619],
+            [0.0, 0.0],
+            [476.58136532, 388.61446619],
+        ])
+        assert np.issubdtype(test_coords.dtype, np.floating)
+        np.testing.assert_allclose(test_coords, expected, rtol=0, atol=1e-8)
+        assert not np.isnan(test_coords).any()
+
+    def test_convert_pxs_to_mm_matches_camera_intrinsics(self):
+        # The implied focal lengths must be consistent with the Kinect2's
+        # factory-calibrated depth intrinsics (fx = fy ~= 368 at 512x424).
+        # The small-angle approximation gave fx=415.5 / fy=404.9, i.e. 10-13%
+        # high, which underestimated every millimetre displacement.
+        resolution, field_of_view = (512, 424), (70.6, 60)
+        expected_fw = resolution[0] / (2 * np.tan(np.deg2rad(field_of_view[0] / 2)))
+        expected_fh = resolution[1] / (2 * np.tan(np.deg2rad(field_of_view[1] / 2)))
+
+        # recover the per-pixel scale from a known one-pixel offset
+        true_depth = 673.1
+        base = np.asarray([[256.0, 212.0]])
+        shifted = np.asarray([[257.0, 213.0]])
+        step = (convert_pxs_to_mm(shifted, resolution, field_of_view, true_depth)
+                - convert_pxs_to_mm(base, resolution, field_of_view, true_depth))[0]
+
+        np.testing.assert_allclose(step[0], true_depth / expected_fw, rtol=1e-6)
+        np.testing.assert_allclose(step[1], true_depth / expected_fh, rtol=1e-6)
+
+        # and those focal lengths sit within 2% of the factory intrinsics
+        assert abs(expected_fw - 368.1) / 368.1 < 0.02
+        assert abs(expected_fh - 368.1) / 368.1 < 0.02
 
     def test_is_legacy(self):
         true_test = {'centroid_x': [1], 'area': 2}
@@ -110,7 +138,7 @@ class TestScalarUtils(TestCase):
         scalar_keys = ['angle', 'area_mm', 'area_px', 'centroid_x_mm', 'centroid_x_px',
                        'centroid_y_mm', 'centroid_y_px', 'height_ave_mm', 'length_mm',
                        'length_px', 'velocity_2d_mm', 'velocity_2d_px', 'velocity_3d_mm',
-                       'velocity_3d_px', 'velocity_theta', 'width_mm', 'width_px']
+                       'velocity_theta', 'width_mm', 'width_px']
 
         for v in test_scalar_map.values():
             assert list(v) == scalar_keys
@@ -177,7 +205,7 @@ class TestScalarUtils(TestCase):
         scalar_keys = ['angle', 'area_mm', 'area_px', 'centroid_x_mm', 'centroid_x_px',
                        'centroid_y_mm', 'centroid_y_px', 'height_ave_mm', 'length_mm',
                        'length_px', 'velocity_2d_mm', 'velocity_2d_px', 'velocity_3d_mm',
-                       'velocity_3d_px', 'velocity_theta', 'width_mm', 'width_px']
+                       'velocity_theta', 'width_mm', 'width_px']
 
         num_frames = 908
         index_data = read_yaml(index_file)
@@ -196,8 +224,8 @@ class TestScalarUtils(TestCase):
 
         for v1, v2 in zip(mapped.values(), z_mapped.values()):
             assert v1.all() != v2.all()
-            assert np.asarray(v1).shape == (17, num_frames)
-            assert np.asarray(v2).shape == (17, num_frames)
+            assert np.asarray(v1).shape == (16, num_frames)
+            assert np.asarray(v2).shape == (16, num_frames)
 
     def test_scalars_to_dataframe(self):
         index_file = 'data/test_index.yaml'
@@ -205,8 +233,10 @@ class TestScalarUtils(TestCase):
         df_cols = ['angle', 'area_mm', 'area_px', 'centroid_x_mm', 'centroid_x_px',
                    'centroid_y_mm', 'centroid_y_px', 'height_ave_mm', 'length_mm',
                    'length_px', 'velocity_2d_mm', 'velocity_2d_px', 'velocity_3d_mm',
-                   'velocity_3d_px', 'velocity_theta', 'width_mm', 'width_px',
+                   'velocity_theta', 'width_mm', 'width_px',
                    'dist_to_center_px', 'group', 'uuid', 'h5_path', 'timestamps',
+                   # public contract: metadata follows include_keys order, not
+                   # incidental YAML/dict insertion order
                    'frame index', 'SessionName', 'SubjectName', 'StartTime']
 
         total_frames = 1800
@@ -282,3 +312,324 @@ class TestScalarUtils(TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class TestDeprecatedScalars(TestCase):
+    """velocity_3d_px mixed pixel and millimetre units; it must not be usable."""
+
+    def test_not_produced_in_new_feature_dict(self):
+        from moseq2_viz.scalars.util import generate_empty_feature_dict
+        feats = generate_empty_feature_dict(10)
+        assert 'velocity_3d_px' not in feats
+        # the dimensionally valid velocities survive untouched
+        for keep in ('velocity_2d_px', 'velocity_2d_mm', 'velocity_3d_mm'):
+            assert keep in feats
+
+    def test_explicit_request_raises_actionable_error(self):
+        from moseq2_viz.scalars.util import check_scalar_is_usable
+        with self.assertRaises(ValueError) as ctx:
+            check_scalar_is_usable('velocity_3d_px')
+        msg = str(ctx.exception)
+        # the message must name the replacements, not just refuse
+        assert 'velocity_3d_mm' in msg and 'velocity_2d_px' in msg
+
+    def test_valid_scalars_are_not_blocked(self):
+        from moseq2_viz.scalars.util import check_scalar_is_usable
+        for ok in ('velocity_2d_px', 'velocity_2d_mm', 'velocity_3d_mm', 'area_mm'):
+            check_scalar_is_usable(ok)  # must not raise
+
+    def _manual_legacy_dataframe(self):
+        return pd.DataFrame({
+            'group': ['g', 'g', 'h', 'h'],
+            'uuid': ['a', 'a', 'b', 'b'],
+            'SubjectName': ['s1', 's1', 's2', 's2'],
+            'SessionName': ['x', 'x', 'y', 'y'],
+            'velocity_3d_px': np.asarray([1, 2, 3, 4], dtype='float32'),
+            'labels (original)': [0, 0, 1, 1],
+            'labels (usage sort)': [0, 0, 1, 1],
+            'onset': [True, False, True, False],
+        })
+
+    def test_scalar_plot_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.viz import scalar_plot
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            scalar_plot(
+                self._manual_legacy_dataframe(),
+                show_scalars=['velocity_3d_px'],
+                headless=True,
+            )
+
+    def test_position_plot_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.viz import position_plot
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            position_plot(
+                self._manual_legacy_dataframe(),
+                centroid_vars=['velocity_3d_px', 'velocity_3d_px'],
+                sort_vars=['uuid'],
+            )
+
+    def test_behavioral_statistics_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.model.util import compute_behavioral_statistics
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            compute_behavioral_statistics(self._manual_legacy_dataframe())
+
+    def test_scalar_embedding_rejects_manual_legacy_dataframe(self):
+        from moseq2_viz.model.embed import run_2d_scalar_embedding
+        with self.assertRaisesRegex(ValueError, 'mixed units'):
+            run_2d_scalar_embedding(self._manual_legacy_dataframe())
+
+    def test_metadata_columns_follow_include_keys_not_source_dict_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'session.h5')
+            policies = {
+                'scalar_px_to_mm': 'pinhole',
+                'area_units': 'mm2-xy-product',
+                'background_dropout': 'masked',
+                'roi_plane_fit': 'lstsq-inlier-refit',
+                'hampel_filter': 'mad-threshold-both-axes',
+                'depth_range_detection': 'histogram-mode',
+                'velocity_3d_px': 'invalid-mixed-units-omitted',
+            }
+            with h5py.File(path, 'w') as f:
+                f.create_dataset('scalars/angle', data=[0.0, 0.1])
+                f.create_dataset('timestamps', data=[0.0, 1.0])
+                f.create_dataset(
+                    'metadata/extraction/pipeline',
+                    data=json.dumps({
+                        'package': 'moseq2-extract',
+                        'policies': policies,
+                    }),
+                )
+            index = {
+                'files': {
+                    'uuid': {
+                        'path': (path, os.path.join(tmp, 'session.yaml')),
+                        'group': 'g',
+                        # Deliberately not the API order.
+                        'metadata': {
+                            'SessionName': 'session',
+                            'StartTime': 'noon',
+                            'SubjectName': 'mouse',
+                        },
+                    },
+                },
+                'pca_path': os.path.join(tmp, 'unused.h5'),
+            }
+            frame = scalars_to_dataframe(index, disable_output=True)
+            metadata = [
+                column for column in frame.columns
+                if column in ('SessionName', 'SubjectName', 'StartTime')
+            ]
+            self.assertEqual(
+                metadata, ['SessionName', 'SubjectName', 'StartTime'])
+
+    def test_legacy_numeric_column_is_dropped_with_warning(self):
+        import warnings as _w
+        from moseq2_viz.scalars.util import drop_deprecated_scalars
+        df = pd.DataFrame({'velocity_3d_px': [1.0, 2.0], 'velocity_3d_mm': [3.0, 4.0]})
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter('always')
+            out = drop_deprecated_scalars(df)
+        assert 'velocity_3d_px' not in out.columns
+        assert 'velocity_3d_mm' in out.columns
+        assert len(caught) >= 1
+
+    def test_legacy_numeric_mapping_stays_a_mapping(self):
+        from moseq2_viz.scalars.util import drop_deprecated_scalars
+        values = {
+            'velocity_3d_px': np.asarray([1.0, 2.0]),
+            'velocity_3d_mm': np.asarray([3.0, 4.0]),
+        }
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            out = drop_deprecated_scalars(values)
+        assert isinstance(out, dict)
+        assert list(out) == ['velocity_3d_mm']
+        np.testing.assert_array_equal(out['velocity_3d_mm'], [3.0, 4.0])
+
+    def test_get_scalar_map_drops_legacy_key_without_losing_mapping(self):
+        index = {
+            'pca_path': 'scores.h5',
+            'files': {'session': {'path': ['session.h5']}},
+        }
+
+        def fake_h5_to_dict(path, key):
+            if key == 'scores_idx':
+                return {'session': np.asarray([0.0, 1.0])}
+            if key == 'scalars':
+                return {
+                    'velocity_3d_px': np.asarray([9.0, 9.0]),
+                    'velocity_3d_mm': np.asarray([3.0, 4.0]),
+                }
+            raise AssertionError((path, key))
+
+        with mock.patch(
+            'moseq2_viz.scalars.util.h5_to_dict',
+            side_effect=fake_h5_to_dict,
+        ), mock.patch(
+            'moseq2_viz.scalars.util.enforce_consistent_provenance',
+            return_value=True,
+        ), warnings.catch_warnings():
+            warnings.simplefilter('ignore')
+            scalar_map = get_scalar_map(index)
+
+        assert isinstance(scalar_map, dict)
+        assert isinstance(scalar_map['session'], dict)
+        assert 'velocity_3d_px' not in scalar_map['session']
+        np.testing.assert_array_equal(
+            scalar_map['session']['velocity_3d_mm'], [3.0, 4.0]
+        )
+
+    def test_legacy_conversion_does_not_recreate_it(self):
+        # convert_legacy_scalars(force=True) must not resurrect the mixed-unit key
+        from moseq2_viz.scalars.util import convert_legacy_scalars
+        n = 20
+        old = {
+            'centroid_x': np.linspace(100, 120, n),
+            'centroid_y': np.linspace(100, 110, n),
+            'width': np.full(n, 30.0), 'length': np.full(n, 60.0),
+            'area': np.full(n, 1500.0), 'height_ave': np.full(n, 40.0),
+            'angle': np.zeros(n),
+        }
+        feats = convert_legacy_scalars(old, force=True)
+        assert 'velocity_3d_px' not in feats
+        assert 'velocity_3d_mm' in feats and np.isfinite(feats['velocity_3d_mm']).all()
+
+    def test_downstream_analysis_works_without_the_key(self):
+        """
+        Analysis helpers must not assume velocity_3d_px is present. This walks
+        a scalar dataframe that never had it through the summarising paths.
+        """
+        from moseq2_viz.scalars.util import (compute_all_pdf_data,
+                                             compute_mean_syll_scalar)
+
+        n = 60
+        df = pd.DataFrame({
+            'centroid_x_mm': np.linspace(-40, 40, n),
+            'centroid_y_mm': np.linspace(-30, 30, n),
+            'velocity_2d_px': np.abs(np.sin(np.arange(n))),
+            'velocity_2d_mm': np.abs(np.sin(np.arange(n))) * 1.86,
+            'velocity_3d_mm': np.abs(np.cos(np.arange(n))) * 1.86,
+            'height_ave_mm': np.full(n, 40.0),
+            'area_mm': np.full(n, 1500.0),
+            'group': ['WT'] * (n // 2) + ['5xFAD'] * (n // 2),
+            'uuid': ['u0'] * (n // 2) + ['u1'] * (n // 2),
+            'SubjectName': ['m0'] * (n // 2) + ['m1'] * (n // 2),
+            'SessionName': ['s0'] * (n // 2) + ['s1'] * (n // 2),
+            'labels (usage sort)': np.tile(np.arange(6), n // 6),
+            'syllable index': np.arange(n),
+            'frame index': np.arange(n),
+        })
+        assert 'velocity_3d_px' not in df.columns
+
+        pdfs, groups, uuids, subjects = compute_all_pdf_data(df)
+        assert len(pdfs) == 2 and len(groups) == 2
+
+        out = compute_mean_syll_scalar(df, scalar='velocity_2d_mm')
+        assert 'velocity_2d_mm' in out.columns
+        assert np.isfinite(out['velocity_2d_mm'].dropna()).all()
+
+    def test_public_scalar_selectors_reject_legacy_dataframe_column(self):
+        from moseq2_viz.scalars.util import (
+            compute_all_pdf_data,
+            compute_mean_syll_scalar,
+            get_scalar_triggered_average,
+            process_scalars,
+        )
+
+        legacy_df = pd.DataFrame({
+            'velocity_3d_px': [1.0],
+            'labels (usage sort)': [0],
+            'group': ['g'],
+            'uuid': ['u'],
+        })
+        with self.assertRaises(ValueError):
+            compute_mean_syll_scalar(legacy_df, scalar='velocity_3d_px')
+        with self.assertRaises(ValueError):
+            compute_all_pdf_data(
+                legacy_df,
+                centroid_vars=['velocity_3d_px', 'velocity_2d_px'],
+            )
+        with self.assertRaises(ValueError):
+            get_scalar_triggered_average(
+                {}, {}, include_keys=['velocity_3d_px']
+            )
+        with self.assertRaises(ValueError):
+            process_scalars({}, ['velocity_3d_px'])
+
+    def test_model_parse_errors_are_not_swallowed(self):
+        handle, model_path = tempfile.mkstemp(suffix='.p')
+        os.close(handle)
+        try:
+            with mock.patch(
+                'moseq2_viz.scalars.util.prepare_model_dataframe',
+                side_effect=ValueError('corrupt model provenance'),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, 'corrupt model provenance'
+                ):
+                    scalars_to_dataframe(
+                        {'pca_path': 'scores.h5', 'files': {}},
+                        model_path=model_path,
+                    )
+        finally:
+            os.remove(model_path)
+
+
+class TestPinholeProjection(TestCase):
+    def test_focal_lengths_and_pixel_scale(self):
+        from moseq2_viz.scalars.util import convert_pxs_to_mm
+        res, fov, depth = (512, 424), (70.6, 60), 673.1
+        fx = res[0] / (2 * np.tan(np.deg2rad(fov[0] / 2)))
+        fy = res[1] / (2 * np.tan(np.deg2rad(fov[1] / 2)))
+        np.testing.assert_allclose(fx, 361.56, atol=0.05)
+        np.testing.assert_allclose(fy, 367.19, atol=0.05)
+
+        base = np.asarray([[256.0, 212.0]])
+        dx = (convert_pxs_to_mm(np.asarray([[257.0, 212.0]]), res, fov, depth)
+              - convert_pxs_to_mm(base, res, fov, depth))[0][0]
+        dy = (convert_pxs_to_mm(np.asarray([[256.0, 213.0]]), res, fov, depth)
+              - convert_pxs_to_mm(base, res, fov, depth))[0][1]
+        np.testing.assert_allclose(dx, 1.862, atol=0.005)
+        np.testing.assert_allclose(dy, 1.833, atol=0.005)
+
+        # the small-angle approximation would NOT satisfy these
+        bad_fx = res[0] / (2 * np.deg2rad(fov[0] / 2))
+        assert abs(bad_fx - 361.56) > 0.05
+
+    def test_image_centre_maps_to_origin(self):
+        from moseq2_viz.scalars.util import convert_pxs_to_mm
+        out = convert_pxs_to_mm(np.asarray([[256.0, 212.0]]), (512, 424), (70.6, 60), 673.1)
+        np.testing.assert_array_equal(out[0], [0.0, 0.0])
+
+    def test_legacy_force_conversion_reaches_the_pinhole_path(self):
+        """
+        Legacy scalars re-converted through viz must land on the same
+        millimetre scale as a fresh extraction, not the small-angle one.
+        """
+        from moseq2_viz.scalars.util import convert_legacy_scalars
+
+        n = 4
+        # legacy layout: unsuffixed centroid/width/length/area/height_ave
+        legacy = {
+            'centroid_x': np.asarray([256.0, 257.0, 258.0, 259.0]),
+            'centroid_y': np.asarray([212.0, 212.0, 212.0, 212.0]),
+            'width': np.full(n, 20.0),
+            'length': np.full(n, 30.0),
+            'area': np.full(n, 600.0),
+            'height_ave': np.full(n, 25.0),
+            'angle': np.zeros(n),
+        }
+        out = convert_legacy_scalars(legacy, force=True, true_depth=673.1)
+
+        # image centre is the origin; each subsequent pixel is one pinhole step
+        step = 673.1 / (512 / (2 * np.tan(np.deg2rad(70.6 / 2))))
+        np.testing.assert_allclose(step, 1.8616, atol=0.0005)
+        np.testing.assert_allclose(out['centroid_x_mm'],
+                                   np.asarray([0.0, 1.0, 2.0, 3.0]) * step,
+                                   atol=1e-6)
+        np.testing.assert_array_equal(out['centroid_y_mm'], np.zeros(n))
+
+        # the small-angle approximation gives a visibly smaller step, so this
+        # assertion fails if the conversion regresses
+        small_angle_step = 673.1 / (512 / (2 * np.deg2rad(70.6 / 2)))
+        assert abs(step - small_angle_step) > 0.15

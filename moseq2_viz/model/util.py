@@ -18,7 +18,7 @@ from typing import Iterator, Any, Dict
 from itertools import product
 from cytoolz.curried import get, get_in
 from os.path import join, basename, dirname
-from moseq2_viz.util import h5_to_dict, star
+from moseq2_viz.util import h5_to_dict, star, validate_scalar_dataframe
 from collections import defaultdict, OrderedDict
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import jensenshannon, dice
@@ -579,6 +579,8 @@ def compute_behavioral_statistics(scalar_df, groupby=['group', 'uuid'], count='u
     Returns:
     features (pandas.DataFrame): full feature Dataframe with scalars, metadata, and syllable statistics.
     """
+
+    validate_scalar_dataframe(scalar_df)
 
     if count not in ('usage', 'frames'):
         raise ValueError('`count` must be either "usage" or "frames"')
