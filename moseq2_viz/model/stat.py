@@ -89,9 +89,15 @@ def ztest_vect(d1, d2):
     std = np.sqrt(std1 ** 2 + std2 ** 2)
     with np.errstate(divide="ignore", invalid="ignore"):
         pvals = np.minimum(1.0, 2 * stats.norm.cdf(-np.abs(mu1 - mu2) / std))
-    # a zero pooled std (a syllable with no bootstrap variance in either group)
-    # carries no evidence of a difference; report p=1 rather than a spurious 0
-    return np.where(std > 0, pvals, 1.0)
+    # A zero pooled std means both groups' bootstrap means are constant. If the
+    # two constants are also equal (e.g. a syllable neither group ever performs)
+    # there is no evidence of a difference -> p=1. If they are constant but
+    # DIFFERENT, that is perfect separation -> p=0. Returning 1 unconditionally
+    # (as an earlier version did) hid genuine all-or-nothing differences.
+    degenerate = std <= 0
+    same_mean = np.isclose(mu1, mu2)
+    pvals = np.where(degenerate, np.where(same_mean, 1.0, 0.0), pvals)
+    return pvals
 
 
 def bootstrap_group_means(df, group1, group2, statistic="usage", max_syllable=40):
@@ -258,6 +264,7 @@ def run_kruskal(
         thresh=0.05,
         mc_method="fdr_bh",
         verbose=False,
+        allow_missing_fill=False,
 ):
     """
     Run Kruskal-Wallis Hypothesis test and Dunn's posthoc multiple comparisons test for syllable statistic.
@@ -271,6 +278,9 @@ def run_kruskal(
     thresh (float): Alpha threshold to consider syllable significant.
     mc_method (str): Multiple Corrections method to use.
     verbose (bool): indicates whether to print out the significant syllable results
+    allow_missing_fill (bool): permit zero-filling missing non-count observations
+        (see below). Defaults to False; must be set explicitly to acknowledge the
+        resulting bias.
 
     Returns:
     df_k_real (pandas.DataFrame): DataFrame of KW test results.
@@ -281,24 +291,30 @@ def run_kruskal(
     rnd = np.random.RandomState(seed=seed)
 
     # The permutation machinery below ranks across a complete session x syllable
-    # matrix, so this path still fills missing entries with 0. For count-like
-    # statistics that is correct. For physical scalars it is not, so warn rather
-    # than silently biasing the result -- prefer t-test/Mann-Whitney/z-test for
-    # those, which drop missing observations properly.
-    if statistic not in COUNT_STATISTICS:
-        _missing = (
+    # matrix, so this path zero-fills missing entries. For count-like statistics
+    # (usage) that is correct: a syllable never performed has a usage of 0. For a
+    # physical scalar (duration, velocity, height, distance) a missing entry means
+    # "never measured", and filling it with 0 mm / 0 mm-per-frame changes the
+    # estimand -- it tests expression probability while reporting it as if it were
+    # a difference in the measured value. A warning here is not enough; it is
+    # dropped from exported figures and easily missed. Refuse outright and direct
+    # the user to the tests that drop missing observations correctly.
+    if statistic not in COUNT_STATISTICS and not allow_missing_fill:
+        missing = (
             get_session_mean_df(df, statistic, max_syllable, fillna_zero=False)
             .isna()
             .to_numpy()
             .sum()
         )
-        if _missing > 0:
-            warnings.warn(
-                f"{_missing} (session, syllable) entries have no '{statistic}' "
-                "observation because those sessions never expressed the syllable. "
-                "The Kruskal-Wallis permutation test requires a complete matrix, so "
-                "they are being treated as 0, which biases this result. Prefer the "
-                "t-test, Mann-Whitney or z-test for non-count statistics."
+        if missing > 0:
+            raise ValueError(
+                f"{missing} (session, syllable) entries have no '{statistic}' "
+                "observation (those sessions never expressed the syllable). The "
+                "Kruskal-Wallis permutation test needs a complete matrix and would "
+                "zero-fill them, which biases the result toward expression-rate "
+                "differences. Use the t-test, Mann-Whitney or z-test for non-count "
+                "statistics, which drop missing observations. To override and accept "
+                "the bias, pass allow_missing_fill=True."
             )
 
     # get mean grouped data

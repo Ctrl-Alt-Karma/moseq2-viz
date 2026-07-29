@@ -58,7 +58,12 @@ def get_num_syllables_for_coverage(labels, n_explained=99):
     syllable_usages = list(get_syllable_usages(labels, count='usage').values())
     cumulative_explanation = np.cumsum(syllable_usages / sum(syllable_usages))
     cumulative_explanation = 100 * cumulative_explanation / np.max(cumulative_explanation)
-    return int(np.argwhere(cumulative_explanation >= n_explained)[0][0])
+    # np.argwhere gives the zero-based INDEX where coverage is reached; callers
+    # use the return value as an exclusive count (`syllable < max_syllable`), so
+    # add 1 to include the syllable that actually crosses the threshold.
+    # Previously, if syllable 0 alone reached the threshold this returned 0 and
+    # the caller kept zero syllables.
+    return int(np.argwhere(cumulative_explanation >= n_explained)[0][0]) + 1
 
 
 def compute_syllable_explained_variance(model, save_dir=os.getcwd(), n_explained=99):
@@ -126,6 +131,16 @@ def merge_models(model_dir, ext='p',count='usage', force_merge=False,
         model_paths[0]: template
     }
 
+    # The default and documented cost_function was 'ar_norm', but the branch
+    # below only recognised 'ar_mat', so the default left `mapping` unbound and
+    # raised UnboundLocalError. Accept 'ar_norm' as the name for the AR-matrix
+    # cost and validate the argument up front.
+    if cost_function in ('ar_norm', 'ar_mat'):
+        cost_function = 'ar_mat'
+    elif cost_function != 'label':
+        raise ValueError(
+            f"cost_function must be one of 'ar_norm'/'ar_mat' or 'label', got {cost_function!r}")
+
     for pth in model_paths[1:]:
         unit_data = parse_model_results(pth, sort_labels_by_usage=True, count=count, map_uuid_to_keys=True)
 
@@ -163,9 +178,9 @@ def merge_models(model_dir, ext='p',count='usage', force_merge=False,
         
         unit_data['labels'] = valmap(_map_sylls, unit_data['labels'])
 
-        # remap the AR matrix
+        # remap the AR matrix (key was misspelled 'are_mat', raising KeyError)
         for k, v in filter(lambda k: k[0] != -5, mapping.items()):
-            unit_data['model_parameters']['are_mat'][k] = curr_ar[v]
+            unit_data['model_parameters']['ar_mat'][k] = curr_ar[v]
         model_data[pth] = unit_data
 
     return model_data
@@ -227,8 +242,10 @@ def get_best_fit(cp_path, model_results):
         'best model - duration (mean match) kappa': model_results[best_model_mean]['model_parameters']['kappa'],
         'min duration median match (seconds)': dist_median,
         'duration distances median': dur_dists_median,
-        'min duration median match (seconds)': dist_mean,
-        'duration distances median': dur_dists_mean,
+        # these two keys were duplicates of the median keys above, so the median
+        # entries silently held the MEAN values; give the mean results their own keys
+        'min duration mean match (seconds)': dist_mean,
+        'duration distances mean': dur_dists_mean,
         'best model - jsd': best_jsd_model,
         'best model - jsd kappa': model_results[best_jsd_model]['model_parameters']['kappa'],
         'min jensen-shannon distance': jsd_dist,

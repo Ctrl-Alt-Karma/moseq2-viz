@@ -152,3 +152,42 @@ class TestMultipleComparisonAxis(TestCase):
         # Hochberg leaves the single largest p-value unchanged, hence >=)
         assert (across_syllables.values >= pvals.values).all()
         assert (across_syllables.values > pvals.values).sum() == len(pvals) - 1
+
+
+class TestExternalReviewRegressions(TestCase):
+    """Regressions for issues raised in a second external review."""
+
+    def test_ztest_constant_but_different_means_is_significant(self):
+        # zero pooled std with DIFFERENT constant means is perfect separation
+        # (p->0), not "no evidence" (p=1). An earlier guard returned 1 for both.
+        from moseq2_viz.model.stat import ztest_vect
+        assert ztest_vect(np.ones((1000, 1)), np.zeros((1000, 1)))[0] == 0.0
+        # equal constants remain p=1 (a syllable neither group performs)
+        assert ztest_vect(np.zeros((1000, 1)), np.zeros((1000, 1)))[0] == 1.0
+
+    def test_transition_matrix_counts_first_transition(self):
+        from moseq2_viz.model.trans_graph import get_transition_matrix, get_state_runs
+        labels = [np.array([0, 0, 1, 1])]
+        m = get_transition_matrix(labels, max_syllable=2, normalize=None, combine=True)
+        assert m[0, 1] == 1
+        np.testing.assert_array_equal(get_state_runs(np.array([0, 0, 1, 1, 0])), [0, 1, 0])
+
+    def test_coverage_count_is_inclusive(self):
+        from moseq2_viz.model.util import get_num_syllables_for_coverage
+        # one syllable covers 100%; used as an exclusive count, must be 1 (not 0)
+        assert get_num_syllables_for_coverage([np.zeros(100, dtype=int)], n_explained=99) == 1
+
+    def test_kruskal_refuses_biased_scalar_fill(self):
+        from moseq2_viz.model.stat import run_kruskal
+        rows = []
+        for group in ("a", "b"):
+            for s in range(4):
+                # group b never performs syllable 1 -> missing height there
+                for syl in (0, 1):
+                    if group == "b" and syl == 1:
+                        continue
+                    rows.append({"group": group, "uuid": f"{group}{s}",
+                                 "syllable": syl, "height_ave_mm_mean": 50.0})
+        df = pd.DataFrame(rows)
+        with self.assertRaises(ValueError):
+            run_kruskal(df, statistic="height_ave_mm_mean", max_syllable=2, n_perm=50)
